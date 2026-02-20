@@ -1,0 +1,5 @@
+{
+  "name": "MockMentor: AI Interview Coach",
+  "description": "A real-time AI-powered interview preparation platform providing instant feedback on communication, confidence, and technical knowledge using Gemini Live API.",
+  "requestFramePermissions": ["camera", "microphone"]
+}
