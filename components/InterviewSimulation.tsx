@@ -18,6 +18,9 @@ interface InterviewSimulationProps {
 
 type SimulationState = 'generating' | 'preparation' | 'active' | 'analyzing';
 
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+const geminiModel = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+
 const LOADING_MESSAGES = [
   'Evaluating your communication style...',
   'Analyzing technical keyword density...',
@@ -272,7 +275,7 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
       sessionIdRef.current = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
       const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+        model: geminiModel,
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },

@@ -2,6 +2,9 @@ import { GoogleGenAI, Type, FunctionDeclaration } from '@google/genai';
 import { InterviewConfig, InterviewResult, InterviewQuestion } from '../types';
 import { withRetry } from '../utils/retry';
 
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+const getGeminiModel = (): string => process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+
 export const generateQuestion = async (config: InterviewConfig): Promise<InterviewQuestion> => {
   try {
     // Always use process.env.API_KEY directly as per guidelines
@@ -17,7 +20,7 @@ export const generateQuestion = async (config: InterviewConfig): Promise<Intervi
 
     const response = await withRetry(() =>
       ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: getGeminiModel(),
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
@@ -63,7 +66,7 @@ export const generateQuestions = async (config: InterviewConfig, count: number =
     const response = await withRetry(
       () =>
         ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: getGeminiModel(),
           contents: prompt,
           config: {
             responseMimeType: 'application/json',
@@ -146,7 +149,7 @@ Also provide:
     const response = await withRetry(
       () =>
         ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: getGeminiModel(),
           contents: prompt,
           config: {
             responseMimeType: 'application/json',
