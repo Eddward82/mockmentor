@@ -45,6 +45,7 @@ MockMentor is an AI-powered interview coaching platform that helps job seekers p
 3. Create a `.env.local` file in the root directory:
    ```
    GEMINI_API_KEY=your_gemini_api_key_here
+   GEMINI_MODEL=gemini-2.5-flash
    ```
 
 4. Run the development server:
@@ -53,6 +54,18 @@ MockMentor is an AI-powered interview coaching platform that helps job seekers p
    ```
 
 5. Open `http://localhost:5173` in your browser.
+
+### Environment Variables
+
+- `GEMINI_API_KEY`: Your Google Gemini API key (required).
+- `GEMINI_MODEL`: Gemini model name to use for all Gemini calls (optional, defaults to `gemini-2.5-flash`).
+
+Example `.env.local`:
+
+```env
+GEMINI_API_KEY=your_api_key
+GEMINI_MODEL=gemini-2.5-flash
+```
 
 ### Deploy
 

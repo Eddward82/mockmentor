@@ -2,6 +2,8 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
 
+const getGeminiModel = (): string => process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+
 export type GeminiHealthStatus = {
   status: 'ok';
   latencyMs: number;
@@ -18,7 +20,7 @@ const getGeminiClient = (): GoogleGenerativeAI => {
 };
 
 export const checkGeminiHealth = async (
-  model = DEFAULT_GEMINI_MODEL
+  model = getGeminiModel()
 ): Promise<GeminiHealthStatus> => {
   const client = getGeminiClient();
   const modelClient = client.getGenerativeModel({ model });
