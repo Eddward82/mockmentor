@@ -8,6 +8,7 @@ import { FeedbackDisplay } from './FeedbackDisplay';
 import { sessionRecovery } from '../services/sessionRecovery';
 import { db, auth } from '../services/firebase';
 import { collection, addDoc, Timestamp } from 'firebase/firestore';
+import { emitLiveSessionEvent } from '../utils/live-session-observability';
 
 interface InterviewSimulationProps {
   config: InterviewConfig;
@@ -17,6 +18,7 @@ interface InterviewSimulationProps {
 }
 
 type SimulationState = 'generating' | 'preparation' | 'active' | 'analyzing';
+type ConnectionState = 'connecting' | 'open' | 'degraded' | 'reconnecting' | 'closed';
 
 const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
 const geminiModel = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
@@ -34,6 +36,7 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
   const [simState, setSimState] = useState<SimulationState>('generating');
   const [activeQuestion, setActiveQuestion] = useState<InterviewQuestion | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [connectionState, setConnectionState] = useState<ConnectionState>('closed');
   const [isPaused, setIsPaused] = useState(false);
   const isPausedRef = useRef(false);
   const [transcription, setTranscription] = useState<string[]>([]);
@@ -80,14 +83,34 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
   const sessionIdRef = useRef<string>('');
   // Prevent reconnect attempts after intentional close
   const interviewFinishedRef = useRef(false);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const startLiveSessionRef = useRef<(isReconnect?: boolean) => void>(() => {});
+
+  const buildEventContext = useCallback(() => ({
+    sessionId: sessionIdRef.current,
+    questionIndex: currentQuestionIndex,
+    elapsedMs: sessionStartTimeRef.current ? Date.now() - sessionStartTimeRef.current : undefined,
+  }), [currentQuestionIndex]);
+
+  const setConnectionStateWithEvent = useCallback((nextState: ConnectionState, reason?: string) => {
+    setConnectionState(nextState);
+    emitLiveSessionEvent('transport_state_change', {
+      ...buildEventContext(),
+      state: nextState,
+      reason,
+    });
+  }, [buildEventContext]);
 
   // Persist a single transcript message to Firestore (fire-and-forget, never throws)
   const persistTranscriptLine = useCallback((role: 'user' | 'ai', text: string) => {
     const user = auth.currentUser;
     if (!user || !sessionIdRef.current) return;
     const colRef = collection(db, 'users', user.uid, 'sessions', sessionIdRef.current, 'transcript');
-    addDoc(colRef, { role, text, timestamp: Timestamp.now() }).catch(() => { /* non-critical */ });
-  }, []);
+    addDoc(colRef, { role, text, timestamp: Timestamp.now() }).catch(() => {
+      emitLiveSessionEvent('transcript_persist_failure', { ...buildEventContext(), role });
+    });
+  }, [buildEventContext]);
 
   const stopQuestionTimer = useCallback(() => {
     if (questionTimerRef.current) {
@@ -102,12 +125,14 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
     if (aiPlaybackEndTimerRef.current) clearTimeout(aiPlaybackEndTimerRef.current);
     if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
     if (audioFlushIntervalRef.current) clearInterval(audioFlushIntervalRef.current);
+    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     if (preAcquiredStreamRef.current) preAcquiredStreamRef.current.getTracks().forEach((t) => t.stop());
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
     sourcesRef.current.forEach((s) => { try { s.stop(); } catch { /* ignore */ } });
     sourcesRef.current.clear();
     audioQueueRef.current = [];
     isAISpeakingRef.current = false;
+    setConnectionState('closed');
   }, []);
 
   // Rotate loading messages
@@ -187,13 +212,39 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
     init();
   }, [config, onError]);
 
-  const startLiveSession = async () => {
+  const scheduleReconnect = useCallback((reason: string) => {
+    if (interviewFinishedRef.current) return;
+    const maxAttempts = 5;
+    if (reconnectAttemptRef.current >= maxAttempts) {
+      setConnectionStateWithEvent('closed', 'reconnect_exhausted');
+      onError('Connection was lost and could not be restored. Please restart the interview session.');
+      return;
+    }
+    reconnectAttemptRef.current += 1;
+    const jitter = Math.floor(Math.random() * 300);
+    const delay = Math.min(1000 * (2 ** (reconnectAttemptRef.current - 1)) + jitter, 10000);
+    setConnectionStateWithEvent('reconnecting', reason);
+    emitLiveSessionEvent('reconnect_attempt', {
+      ...buildEventContext(),
+      reason,
+      attempt: reconnectAttemptRef.current,
+      delayMs: delay,
+    });
+    reconnectTimerRef.current = window.setTimeout(() => {
+      if (!interviewFinishedRef.current) startLiveSessionRef.current(true);
+    }, delay);
+  }, [buildEventContext, onError, setConnectionStateWithEvent]);
+
+  const startLiveSession = async (isReconnect = false) => {
     setSimState('active');
     setIsConnecting(true);
+    setConnectionStateWithEvent(isReconnect ? 'reconnecting' : 'connecting', isReconnect ? 'retry' : 'initial_connect');
     sessionStartTimeRef.current = sessionStartTimeRef.current || Date.now();
-    questionStartTimeRef.current = Date.now();
+    if (!isReconnect) {
+      questionStartTimeRef.current = Date.now();
+    }
     const isLast = currentQuestionIndex >= questions.length - 1;
-    if (activeQuestion) startQuestionTimer(activeQuestion, isLast);
+    if (!isReconnect && activeQuestion) startQuestionTimer(activeQuestion, isLast);
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         onError('Camera/Microphone not available. Make sure you are using HTTPS or localhost.');
@@ -210,7 +261,9 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
 
       // Reuse pre-acquired stream or acquire with echo cancellation
       let stream: MediaStream;
-      if (preAcquiredStreamRef.current) {
+      if (streamRef.current && streamRef.current.getAudioTracks().some((track) => track.readyState === 'live')) {
+        stream = streamRef.current;
+      } else if (preAcquiredStreamRef.current) {
         stream = preAcquiredStreamRef.current;
         preAcquiredStreamRef.current = null;
       } else {
@@ -246,6 +299,7 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
         const recoverVideoTrack = async () => {
           if (videoTrackRecoveryAttemptedRef.current || interviewFinishedRef.current) return;
           videoTrackRecoveryAttemptedRef.current = true;
+          emitLiveSessionEvent('camera_recovery_attempt', buildEventContext());
           try {
             const refreshed = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
             const [freshTrack] = refreshed.getVideoTracks();
@@ -256,7 +310,9 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
               videoRef.current.srcObject = streamRef.current;
               videoRef.current.play().catch(() => { /* best effort */ });
             }
+            emitLiveSessionEvent('camera_recovery_success', buildEventContext());
           } catch {
+            emitLiveSessionEvent('camera_recovery_failure', buildEventContext());
             onError('Camera feed was interrupted. Please verify camera permissions and device availability.');
           }
         };
@@ -271,8 +327,10 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
       sessionRef.current = null;
       isAISpeakingRef.current = false;
       interviewFinishedRef.current = false;
-      // New session ID for Firestore transcript bucket
-      sessionIdRef.current = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      if (!isReconnect || !sessionIdRef.current) {
+        // New session ID for Firestore transcript bucket
+        sessionIdRef.current = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      }
 
       const sessionPromise = ai.live.connect({
         model: geminiModel,
@@ -316,8 +374,10 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
         callbacks: {
           onopen: () => {
             sessionOpenRef.current = true;
+            reconnectAttemptRef.current = 0;
             sessionPromise.then((s) => { sessionRef.current = s; });
             setIsConnecting(false);
+            setConnectionStateWithEvent('open', isReconnect ? 'reconnected' : 'opened');
 
             // --- Audio queue: buffer PCM chunks, flush every 150ms ---
             const source = inputAudioCtx.createMediaStreamSource(stream);
@@ -339,7 +399,12 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
                 const chunk = audioQueueRef.current.shift()!;
                 try {
                   sessionRef.current.sendRealtimeInput({ media: { data: chunk, mimeType: 'audio/pcm;rate=16000' } });
-                } catch { audioQueueRef.current = []; break; }
+                } catch {
+                  emitLiveSessionEvent('realtime_send_failure', buildEventContext());
+                  audioQueueRef.current = [];
+                  setConnectionStateWithEvent('degraded', 'audio_send_failed');
+                  break;
+                }
               }
             }, 150);
 
@@ -350,7 +415,10 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
               const silence = encode(new Uint8Array(512)); // 256 int16 = 512 bytes of zeros
               try {
                 sessionRef.current.sendRealtimeInput({ media: { data: silence, mimeType: 'audio/pcm;rate=16000' } });
-              } catch { /* session closed */ }
+              } catch {
+                emitLiveSessionEvent('heartbeat_failure', buildEventContext());
+                setConnectionStateWithEvent('degraded', 'heartbeat_failed');
+              }
             }, 20000);
 
             if (!hasVideo) return;
@@ -365,7 +433,9 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
                       const data = await blobToBase64(blob);
                       try {
                         sessionRef.current.sendRealtimeInput({ media: { data, mimeType: 'image/jpeg' } });
-                      } catch { /* session closed */ }
+                      } catch {
+                        emitLiveSessionEvent('realtime_send_failure', { ...buildEventContext(), mediaType: 'image/jpeg' });
+                      }
                     }
                   },
                   'image/jpeg',
@@ -424,7 +494,10 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
               }
             }
           },
-          onerror: (e: any) => { console.error('Gemini Live error:', e); },
+          onerror: (e: any) => {
+            setConnectionStateWithEvent('degraded', 'socket_error');
+            console.error('Gemini Live error:', e);
+          },
           onclose: (e: any) => {
             sessionOpenRef.current = false;
             sessionRef.current = null;
@@ -432,22 +505,25 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
             audioQueueRef.current = [];
             if (heartbeatIntervalRef.current) { clearInterval(heartbeatIntervalRef.current); heartbeatIntervalRef.current = null; }
             if (audioFlushIntervalRef.current) { clearInterval(audioFlushIntervalRef.current); audioFlushIntervalRef.current = null; }
+            setConnectionStateWithEvent('closed', e?.reason || 'socket_closed');
             console.warn('Gemini Live closed — code:', e?.code, 'reason:', e?.reason);
             // Reconnect only if the interview is still in progress and close was unexpected
             if (!interviewFinishedRef.current && e?.code !== 1000) {
-              console.log('Unexpected close — attempting reconnect...');
-              setTimeout(() => { if (!interviewFinishedRef.current) startLiveSession(); }, 2000);
+              scheduleReconnect(e?.reason || `code_${e?.code || 'unknown'}`);
             }
           }
         }
       });
       sessionPromiseRef.current = sessionPromise;
     } catch (err) {
+      setConnectionStateWithEvent('degraded', 'connect_failed');
       console.error('Live session error:', err);
       const message = err instanceof Error ? err.message : String(err);
       onError(`Failed to start AI session: ${message}`);
     }
   };
+
+  startLiveSessionRef.current = startLiveSession;
 
   useEffect(() => cleanup, [cleanup]);
 
@@ -725,6 +801,7 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
               <p className="font-black text-slate-800 dark:text-white text-lg" aria-live="polite">
                 {isConnecting ? 'Establishing...' : isPaused ? 'Paused' : 'Recording Active'}
               </p>
+              <p className="text-xs font-bold text-slate-500">Transport: {connectionState}</p>
             </div>
             {questionTimeRemaining != null && (
               <div

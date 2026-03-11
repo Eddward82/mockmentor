@@ -17,9 +17,12 @@ const mockSession: RecoverableSession = {
   savedAt: Date.now()
 };
 
+const STORAGE_KEY = 'mockmentor-session-recovery';
+
 describe('sessionRecovery', () => {
   beforeEach(() => {
     sessionStorage.clear();
+    localStorage.clear();
   });
 
   it('should save and load a session', () => {
@@ -61,5 +64,25 @@ describe('sessionRecovery', () => {
     const recentSession = { ...mockSession, savedAt: Date.now() - 30 * 60 * 1000 };
     sessionRecovery.save(recentSession);
     expect(sessionRecovery.load()).not.toBeNull();
+  });
+
+  it('should load from localStorage backup when sessionStorage is missing', () => {
+    sessionRecovery.save(mockSession);
+    sessionStorage.clear();
+
+    const loaded = sessionRecovery.load();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.config.jobTitle).toBe(mockSession.config.jobTitle);
+  });
+
+  it('should reject corrupted wrapped payloads', () => {
+    const wrapped = {
+      version: 1,
+      checksum: 1,
+      payload: mockSession,
+    };
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(wrapped));
+
+    expect(sessionRecovery.load()).toBeNull();
   });
 });
