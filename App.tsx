@@ -22,6 +22,7 @@ import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { useTheme } from './hooks/useTheme';
 import { sessionRecovery } from './services/sessionRecovery';
+import { interviewFlowService } from './application/services/interview-flow-service';
 
 // Hash-based routing: maps AppView to URL hashes for SEO & shareability
 const VIEW_TO_HASH: Partial<Record<AppView, string>> = {
@@ -30,7 +31,7 @@ const VIEW_TO_HASH: Partial<Record<AppView, string>> = {
   [AppView.PRIVACY]: 'privacy',
   [AppView.SETUP]: 'setup',
   [AppView.DASHBOARD]: 'dashboard',
-  [AppView.SETTINGS]: 'settings',
+  [AppView.SETTINGS]: 'settings'
 };
 
 const HASH_TO_VIEW: Record<string, AppView> = Object.entries(VIEW_TO_HASH).reduce(
@@ -92,7 +93,9 @@ const App: React.FC = () => {
         console.warn('Could not save to Firestore (offline?), plan is active locally for this session');
       }
     };
-    return () => { delete (window as any).setPlan; };
+    return () => {
+      delete (window as any).setPlan;
+    };
   }, []);
 
   useEffect(() => {
@@ -109,17 +112,24 @@ const App: React.FC = () => {
           planService.getUserPlan().then(setUserPlan).catch(console.error);
           // Real-time listener: auto-updates plan when webhook writes to Firestore
           const planRef = doc(db, 'users', currentUser.uid, 'profile', 'plan');
-          unsubPlan = onSnapshot(planRef, (snap) => {
-            if (snap.exists()) {
-              const plan = snap.data().plan as UserPlan;
-              if (plan === 'professional' || plan === 'premium' || plan === 'starter') {
-                setUserPlan(plan);
+          unsubPlan = onSnapshot(
+            planRef,
+            (snap) => {
+              if (snap.exists()) {
+                const plan = snap.data().plan as UserPlan;
+                if (plan === 'professional' || plan === 'premium' || plan === 'starter') {
+                  setUserPlan(plan);
+                }
               }
-            }
-          }, (err) => console.warn('Plan listener error:', err));
+            },
+            (err) => console.warn('Plan listener error:', err)
+          );
         } else {
           // User signed out — clean up plan listener
-          if (unsubPlan) { unsubPlan(); unsubPlan = null; }
+          if (unsubPlan) {
+            unsubPlan();
+            unsubPlan = null;
+          }
           setUserPlan('starter');
         }
       },
@@ -167,33 +177,12 @@ const App: React.FC = () => {
     setLastResult(result);
     setHistory((prev) => [result, ...prev]); // Update history immediately for instant Dashboard display
     setCurrentView(AppView.RESULTS);
-    persistenceService.saveInterview(result)
-      .catch((e) => console.error('Failed to save session:', e));
+    persistenceService.saveInterview(result).catch((e) => console.error('Failed to save session:', e));
   };
 
   const handleStartInterviewFlow = (cfg: InterviewConfig) => {
-    const limits = PLAN_LIMITS[userPlan];
-
-    // Check session count (null = unlimited, skip check)
-    if (limits.sessionLimit !== null) {
-      const startOfMonth = new Date();
-      startOfMonth.setDate(1);
-      startOfMonth.setHours(0, 0, 0, 0);
-      const sessionCount = history.filter((item) => new Date(item.date) >= startOfMonth).length;
-      if (sessionCount >= limits.sessionLimit) {
-        setShowUpgradeModal(true);
-        return;
-      }
-    }
-
-    // Check audio minutes cap
-    const startOfMonth = new Date();
-    startOfMonth.setDate(1);
-    startOfMonth.setHours(0, 0, 0, 0);
-    const audioUsedMinutes = history
-      .filter((item) => new Date(item.date) >= startOfMonth)
-      .reduce((sum, item) => sum + (item.duration ?? 0), 0) / 60;
-    if (audioUsedMinutes >= limits.maxAudioMinutesPerMonth) {
+    const decision = interviewFlowService.canStartInterview(userPlan, history);
+    if (!decision.allowed) {
       setShowUpgradeModal(true);
       return;
     }
@@ -231,18 +220,40 @@ const App: React.FC = () => {
 
     switch (currentView) {
       case AppView.HOME:
-        return <Home onStart={() => setCurrentView(AppView.SETUP)} onGoDashboard={() => setCurrentView(AppView.DASHBOARD)} onGoTerms={() => setCurrentView(AppView.TERMS)} onGoPrivacy={() => setCurrentView(AppView.PRIVACY)} />;
+        return (
+          <Home
+            onStart={() => setCurrentView(AppView.SETUP)}
+            onGoDashboard={() => setCurrentView(AppView.DASHBOARD)}
+            onGoTerms={() => setCurrentView(AppView.TERMS)}
+            onGoPrivacy={() => setCurrentView(AppView.PRIVACY)}
+          />
+        );
       case AppView.TERMS:
         return <TermsOfService onGoHome={() => setCurrentView(AppView.HOME)} />;
       case AppView.PRIVACY:
         return <PrivacyPolicy onGoHome={() => setCurrentView(AppView.HOME)} />;
       case AppView.SETUP:
-        return <SetupWizard onStart={handleStartInterviewFlow} maxQuestions={PLAN_LIMITS[userPlan].maxQuestionsPerSession} userPlan={userPlan} />;
+        return (
+          <SetupWizard
+            onStart={handleStartInterviewFlow}
+            maxQuestions={PLAN_LIMITS[userPlan].maxQuestionsPerSession}
+            userPlan={userPlan}
+          />
+        );
       case AppView.SIMULATION:
         return activeConfig ? (
-          <InterviewSimulation config={activeConfig} onFinish={handleFinishInterview} onError={setError} questionTimeLimitCap={PLAN_LIMITS[userPlan].questionTimeLimitCap} />
+          <InterviewSimulation
+            config={activeConfig}
+            onFinish={handleFinishInterview}
+            onError={setError}
+            questionTimeLimitCap={PLAN_LIMITS[userPlan].questionTimeLimitCap}
+          />
         ) : (
-          <SetupWizard onStart={handleStartInterviewFlow} maxQuestions={PLAN_LIMITS[userPlan].maxQuestionsPerSession} userPlan={userPlan} />
+          <SetupWizard
+            onStart={handleStartInterviewFlow}
+            maxQuestions={PLAN_LIMITS[userPlan].maxQuestionsPerSession}
+            userPlan={userPlan}
+          />
         );
       case AppView.RESULTS:
         return lastResult ? (
@@ -254,12 +265,22 @@ const App: React.FC = () => {
         return <Dashboard history={history} onStartNew={() => setCurrentView(AppView.SETUP)} />;
       case AppView.SETTINGS:
         return user ? (
-          <Settings user={user} userPlan={userPlan} theme={theme} onToggleTheme={toggleTheme} onSignOut={() => signOut(auth)} history={history} onClearHistory={handleClearHistory} />
+          <Settings
+            user={user}
+            userPlan={userPlan}
+            theme={theme}
+            onToggleTheme={toggleTheme}
+            onSignOut={() => signOut(auth)}
+            history={history}
+            onClearHistory={handleClearHistory}
+          />
         ) : (
           <Login />
         );
       default:
-        return <Home onStart={() => setCurrentView(AppView.SETUP)} onGoDashboard={() => setCurrentView(AppView.DASHBOARD)} />;
+        return (
+          <Home onStart={() => setCurrentView(AppView.SETUP)} onGoDashboard={() => setCurrentView(AppView.DASHBOARD)} />
+        );
     }
   };
 
@@ -356,10 +377,7 @@ const App: React.FC = () => {
 
       {showUpgradeModal && (
         <Suspense fallback={null}>
-          <UpgradeModal
-            userPlan={userPlan}
-            onClose={() => setShowUpgradeModal(false)}
-          />
+          <UpgradeModal userPlan={userPlan} onClose={() => setShowUpgradeModal(false)} />
         </Suspense>
       )}
 
