@@ -63,12 +63,11 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
   const streamRef = useRef<MediaStream | null>(null);
   const preAcquiredStreamRef = useRef<MediaStream | null>(null);
   const frameIntervalRef = useRef<number | null>(null);
+  const videoTrackRecoveryAttemptedRef = useRef(false);
   const sessionStartTimeRef = useRef<number | null>(null);
   // Track whether AI is currently speaking to mute mic input during playback
   const isAISpeakingRef = useRef(false);
   const aiPlaybackEndTimerRef = useRef<number | null>(null);
-  // Delay AI response by 1s after user speech ends to avoid premature replies
-  const responseDelayTimerRef = useRef<number | null>(null);
   // Heartbeat: periodic no-op send to keep the Gemini session alive
   const heartbeatIntervalRef = useRef<number | null>(null);
   // Audio queue: buffer PCM chunks and flush every 150ms to smooth network jitter
@@ -98,7 +97,6 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
     if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
     if (questionTimerRef.current) clearInterval(questionTimerRef.current);
     if (aiPlaybackEndTimerRef.current) clearTimeout(aiPlaybackEndTimerRef.current);
-    if (responseDelayTimerRef.current) clearTimeout(responseDelayTimerRef.current);
     if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
     if (audioFlushIntervalRef.current) clearInterval(audioFlushIntervalRef.current);
     if (preAcquiredStreamRef.current) preAcquiredStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -233,7 +231,35 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
 
       streamRef.current = stream;
       const hasVideo = stream.getVideoTracks().length > 0;
-      if (videoRef.current && hasVideo) videoRef.current.srcObject = stream;
+      if (videoRef.current && hasVideo) {
+        videoRef.current.srcObject = stream;
+        // Improve camera reliability across browsers/devices by explicitly playing.
+        videoRef.current.play().catch(() => { /* autoplay policies may block, user interaction usually follows */ });
+      }
+
+      const [videoTrack] = stream.getVideoTracks();
+      if (videoTrack) {
+        videoTrackRecoveryAttemptedRef.current = false;
+        const recoverVideoTrack = async () => {
+          if (videoTrackRecoveryAttemptedRef.current || interviewFinishedRef.current) return;
+          videoTrackRecoveryAttemptedRef.current = true;
+          try {
+            const refreshed = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+            const [freshTrack] = refreshed.getVideoTracks();
+            if (!freshTrack || !streamRef.current) return;
+            streamRef.current.removeTrack(videoTrack);
+            streamRef.current.addTrack(freshTrack);
+            if (videoRef.current) {
+              videoRef.current.srcObject = streamRef.current;
+              videoRef.current.play().catch(() => { /* best effort */ });
+            }
+          } catch {
+            onError('Camera feed was interrupted. Please verify camera permissions and device availability.');
+          }
+        };
+        videoTrack.onended = recoverVideoTrack;
+        videoTrack.onmute = recoverVideoTrack;
+      }
 
       const inputAudioCtx = new AudioContext({ sampleRate: 16000 });
       const outputAudioCtx = new AudioContext({ sampleRate: 24000 });
@@ -356,12 +382,6 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
             if (inText) {
               setTranscription((p: string[]) => [...p, `User: ${inText}`]);
               persistTranscriptLine('user', inText);
-              // 1s grace period after user speech ends before mic re-opens
-              if (responseDelayTimerRef.current) clearTimeout(responseDelayTimerRef.current);
-              isAISpeakingRef.current = true;
-              responseDelayTimerRef.current = window.setTimeout(() => {
-                if (!isPausedRef.current) isAISpeakingRef.current = false;
-              }, 1000);
             }
 
             // Process audio parts — mark AI as speaking while audio plays
