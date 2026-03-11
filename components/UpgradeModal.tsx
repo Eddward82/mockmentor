@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { UserPlan, PLAN_LIMITS } from '../types';
-import { openCheckout, type BillingInterval } from '../services/lemonSqueezyService';
-import { useLemonSqueezy } from '../hooks/useLemonSqueezy';
+import { openCheckout, type BillingInterval } from '../services/polarService';
 
 interface UpgradeModalProps {
   userPlan: UserPlan;
@@ -82,14 +81,8 @@ const PlanCard: React.FC<PlanCardProps> = ({ plan, price, priceSuffix, features,
 
 export const UpgradeModal: React.FC<UpgradeModalProps> = ({ userPlan, onClose }) => {
   const limits = PLAN_LIMITS[userPlan];
-  const sessionLabel = limits.isLifetimeLimit ? 'lifetime' : 'monthly';
-  const [activating, setActivating] = useState(false);
+  const activating = false;
   const [billingInterval, setBillingInterval] = useState<BillingInterval>('monthly');
-
-  useLemonSqueezy(() => {
-    // Checkout.Success fires in the overlay — plan will be activated by webhook
-    setActivating(true);
-  });
 
   const handleUpgrade = (plan: 'professional' | 'premium') => {
     openCheckout(plan, billingInterval);
@@ -116,8 +109,10 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({ userPlan, onClose })
               <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
                 {activating
                   ? 'Your plan is being activated. This may take a few seconds...'
-                  : <>You've used all {limits.sessionLimit} {sessionLabel} sessions on the{' '}
-                    <span className="font-bold text-slate-700 dark:text-slate-300">{limits.label}</span> plan.</>
+                  : limits.sessionLimit === null
+                    ? <>You've reached the audio limit on the <span className="font-bold text-slate-700 dark:text-slate-300">{limits.label}</span> plan.</>
+                    : <>You've used all {limits.sessionLimit} monthly sessions on the{' '}
+                      <span className="font-bold text-slate-700 dark:text-slate-300">{limits.label}</span> plan.</>
                 }
               </p>
             </div>
@@ -151,7 +146,7 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({ userPlan, onClose })
           <PlanCard
             plan="starter"
             price="Free"
-            features={['3 lifetime sessions', '1 question per session', 'Basic feedback']}
+            features={['5 sessions/month', 'Up to 3 questions', 'Basic feedback']}
             isCurrent={userPlan === 'starter'}
             onUpgrade={handleUpgrade}
             activating={activating}
@@ -160,7 +155,7 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({ userPlan, onClose })
             plan="professional"
             price={billingInterval === 'monthly' ? '$19' : '$182'}
             priceSuffix={billingInterval === 'monthly' ? '/mo' : '/yr'}
-            features={['8 sessions/month', 'Up to 3 questions', 'Detailed AI feedback', 'Dashboard history']}
+            features={['20 sessions/month', 'Up to 5 questions', 'Detailed AI feedback', 'Dashboard history']}
             isCurrent={userPlan === 'professional'}
             onUpgrade={handleUpgrade}
             activating={activating}
@@ -169,7 +164,7 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({ userPlan, onClose })
             plan="premium"
             price={billingInterval === 'monthly' ? '$49' : '$470'}
             priceSuffix={billingInterval === 'monthly' ? '/mo' : '/yr'}
-            features={['20 sessions/month', 'Up to 5 questions', 'Advanced analytics', 'Priority support']}
+            features={['Unlimited sessions', 'Up to 10 questions', 'Advanced analytics', 'Priority support']}
             isCurrent={userPlan === 'premium'}
             onUpgrade={handleUpgrade}
             activating={activating}
@@ -177,7 +172,7 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({ userPlan, onClose })
         </div>
 
         <div className="px-8 pb-6 text-center text-xs text-slate-400 dark:text-slate-500">
-          Secure payment powered by Lemon Squeezy. Cancel anytime.
+          Secure payment powered by Polar. Cancel anytime.
         </div>
       </div>
     </div>

@@ -100,8 +100,8 @@ export const exportAsPDF = (session: InterviewResult): void => {
         }
         .metrics-grid {
           display: grid;
-          grid-template-columns: repeat(5, 1fr);
-          gap: 15px;
+          grid-template-columns: repeat(4, 1fr);
+          gap: 12px;
         }
         .metric {
           background: #f8fafc;
@@ -151,6 +151,28 @@ export const exportAsPDF = (session: InterviewResult): void => {
           margin-bottom: 10px;
           border-radius: 8px;
           border-left: 4px solid #22c55e;
+          font-size: 14px;
+        }
+        .strengths-list {
+          list-style: none;
+        }
+        .strengths-list li {
+          padding: 10px 15px;
+          background: #f0fdf4;
+          margin-bottom: 8px;
+          border-radius: 8px;
+          border-left: 4px solid #22c55e;
+          font-size: 14px;
+        }
+        .improvement-list {
+          list-style: none;
+        }
+        .improvement-list li {
+          padding: 10px 15px;
+          background: #fefce8;
+          margin-bottom: 8px;
+          border-radius: 8px;
+          border-left: 4px solid #eab308;
           font-size: 14px;
         }
         .question-block {
@@ -209,7 +231,7 @@ export const exportAsPDF = (session: InterviewResult): void => {
         }
         @media print {
           body { padding: 20px; }
-          .metrics-grid { grid-template-columns: repeat(5, 1fr); }
+          .metrics-grid { grid-template-columns: repeat(4, 1fr); }
         }
       </style>
     </head>
@@ -224,8 +246,12 @@ export const exportAsPDF = (session: InterviewResult): void => {
       </div>
 
       <div class="section">
-        <h2>Performance Metrics</h2>
+        <h2>Performance Scorecard</h2>
         <div class="metrics-grid">
+          <div class="metric">
+            <div class="metric-value">${session.metrics.overall}%</div>
+            <div class="metric-label">Overall</div>
+          </div>
           <div class="metric">
             <div class="metric-value">${session.metrics.communication}%</div>
             <div class="metric-label">Communication</div>
@@ -242,12 +268,34 @@ export const exportAsPDF = (session: InterviewResult): void => {
             <div class="metric-value">${session.metrics.bodyLanguage}%</div>
             <div class="metric-label">Body Language</div>
           </div>
+          ${session.metrics.answerStructure != null ? `
           <div class="metric">
-            <div class="metric-value">${session.metrics.overall}%</div>
-            <div class="metric-label">Overall</div>
-          </div>
+            <div class="metric-value">${session.metrics.answerStructure}%</div>
+            <div class="metric-label">Answer Structure</div>
+          </div>` : ''}
+          ${session.metrics.clarity != null ? `
+          <div class="metric">
+            <div class="metric-value">${session.metrics.clarity}%</div>
+            <div class="metric-label">Clarity</div>
+          </div>` : ''}
         </div>
       </div>
+
+      ${session.strengths && session.strengths.length > 0 ? `
+      <div class="section">
+        <h2>Strengths</h2>
+        <ul class="strengths-list">
+          ${session.strengths.map((s) => `<li>${s}</li>`).join('')}
+        </ul>
+      </div>` : ''}
+
+      ${session.improvementAreas && session.improvementAreas.length > 0 ? `
+      <div class="section">
+        <h2>Improvement Areas</h2>
+        <ul class="improvement-list">
+          ${session.improvementAreas.map((s) => `<li>${s}</li>`).join('')}
+        </ul>
+      </div>` : ''}
 
       <div class="info-row">
         <div class="info-item">

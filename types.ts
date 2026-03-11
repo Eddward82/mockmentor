@@ -36,6 +36,8 @@ export interface FeedbackMetrics {
   confidence: number;
   technicalAccuracy: number;
   bodyLanguage: number;
+  answerStructure: number;
+  clarity: number;
   overall: number;
 }
 
@@ -44,10 +46,12 @@ export interface InterviewResult {
   date: string;
   config: InterviewConfig;
   metrics: FeedbackMetrics;
-  suggestions: string[];
+  suggestions: string[];       // improvement plan (3 actionable steps)
+  strengths?: string[];        // 3 things done well
+  improvementAreas?: string[]; // 3 areas to work on
   transcription: string;
-  duration?: number; // Session duration in seconds
-  questions?: QuestionResponse[]; // Array of all questions and responses
+  duration?: number;
+  questions?: QuestionResponse[];
 }
 
 export interface LiveAnalysis {
@@ -70,15 +74,16 @@ export enum AppView {
 export type UserPlan = 'starter' | 'professional' | 'premium';
 
 export interface PlanLimits {
-  sessionLimit: number;
+  sessionLimit: number | null; // null = unlimited
   isLifetimeLimit: boolean;
   maxQuestionsPerSession: number;
   questionTimeLimitCap: number; // Max seconds allowed per question answer
+  maxAudioMinutesPerMonth: number;
   label: string;
 }
 
 export const PLAN_LIMITS: Record<UserPlan, PlanLimits> = {
-  starter:      { sessionLimit: 3,  isLifetimeLimit: true,  maxQuestionsPerSession: 1, questionTimeLimitCap: 90,  label: 'Starter' },
-  professional: { sessionLimit: 8,  isLifetimeLimit: false, maxQuestionsPerSession: 3, questionTimeLimitCap: 120, label: 'Professional' },
-  premium:      { sessionLimit: 20, isLifetimeLimit: false, maxQuestionsPerSession: 5, questionTimeLimitCap: 180, label: 'Premium' },
+  starter:      { sessionLimit: 5,    isLifetimeLimit: false, maxQuestionsPerSession: 3,  questionTimeLimitCap: 90,  maxAudioMinutesPerMonth: 15,  label: 'Starter' },
+  professional: { sessionLimit: 20,   isLifetimeLimit: false, maxQuestionsPerSession: 5,  questionTimeLimitCap: 120, maxAudioMinutesPerMonth: 120, label: 'Professional' },
+  premium:      { sessionLimit: null, isLifetimeLimit: false, maxQuestionsPerSession: 10, questionTimeLimitCap: 180, maxAudioMinutesPerMonth: 600, label: 'Premium' },
 };

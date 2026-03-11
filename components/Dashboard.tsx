@@ -76,10 +76,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ history, onStartNew }) => 
 
   const radarData = [
     { subject: 'Communication', A: latest.metrics.communication, fullMark: 100 },
-    { subject: 'Confidence', A: latest.metrics.confidence, fullMark: 100 },
-    { subject: 'Technical', A: latest.metrics.technicalAccuracy, fullMark: 100 },
+    { subject: 'Confidence',    A: latest.metrics.confidence, fullMark: 100 },
+    { subject: 'Technical',     A: latest.metrics.technicalAccuracy, fullMark: 100 },
+    { subject: 'Structure',     A: latest.metrics.answerStructure ?? 0, fullMark: 100 },
+    { subject: 'Clarity',       A: latest.metrics.clarity ?? 0, fullMark: 100 },
     { subject: 'Body Language', A: latest.metrics.bodyLanguage, fullMark: 100 },
-    { subject: 'Overall', A: latest.metrics.overall, fullMark: 100 }
   ];
 
   const trendData = [...history].reverse().map((h: InterviewResult) => ({
@@ -310,20 +311,52 @@ export const Dashboard: React.FC<DashboardProps> = ({ history, onStartNew }) => 
                 <h4 className="text-xs font-black uppercase text-slate-400 tracking-widest mb-4">
                   Performance Metrics
                 </h4>
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                   {[
-                    { label: 'Communication', value: selectedSession.metrics.communication },
-                    { label: 'Confidence', value: selectedSession.metrics.confidence },
-                    { label: 'Technical', value: selectedSession.metrics.technicalAccuracy },
-                    { label: 'Body Language', value: selectedSession.metrics.bodyLanguage },
-                    { label: 'Overall', value: selectedSession.metrics.overall }
+                    { label: 'Communication',    value: selectedSession.metrics.communication },
+                    { label: 'Confidence',        value: selectedSession.metrics.confidence },
+                    { label: 'Technical',         value: selectedSession.metrics.technicalAccuracy },
+                    { label: 'Body Language',     value: selectedSession.metrics.bodyLanguage },
+                    { label: 'Answer Structure',  value: selectedSession.metrics.answerStructure ?? '—' },
+                    { label: 'Clarity',           value: selectedSession.metrics.clarity ?? '—' },
+                    { label: 'Overall',           value: selectedSession.metrics.overall },
                   ].map((metric) => (
                     <div key={metric.label} className="bg-slate-50 dark:bg-slate-700 rounded-2xl p-4 text-center">
-                      <p className="text-2xl font-black text-slate-900 dark:text-white">{metric.value}%</p>
+                      <p className="text-2xl font-black text-slate-900 dark:text-white">{metric.value}{typeof metric.value === 'number' ? '%' : ''}</p>
                       <p className="text-xs font-bold text-slate-500 mt-1">{metric.label}</p>
                     </div>
                   ))}
                 </div>
+
+                {/* Strengths */}
+                {selectedSession.strengths && selectedSession.strengths.length > 0 && (
+                  <div className="mt-4">
+                    <p className="text-xs font-black uppercase text-slate-400 tracking-widest mb-3">Strengths</p>
+                    <ul className="space-y-2">
+                      {selectedSession.strengths.map((s, i) => (
+                        <li key={i} className="flex items-start gap-2 text-sm text-slate-700 dark:text-slate-200">
+                          <span className="w-2 h-2 bg-green-500 rounded-full flex-shrink-0 mt-1.5" />
+                          {s}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* Improvement Areas */}
+                {selectedSession.improvementAreas && selectedSession.improvementAreas.length > 0 && (
+                  <div className="mt-4">
+                    <p className="text-xs font-black uppercase text-slate-400 tracking-widest mb-3">Improvement Areas</p>
+                    <ul className="space-y-2">
+                      {selectedSession.improvementAreas.map((s, i) => (
+                        <li key={i} className="flex items-start gap-2 text-sm text-slate-700 dark:text-slate-200">
+                          <span className="w-2 h-2 bg-yellow-500 rounded-full flex-shrink-0 mt-1.5" />
+                          {s}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
 
               {/* Duration */}

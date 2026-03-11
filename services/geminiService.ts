@@ -121,13 +121,27 @@ export const generateInterviewSummary = async (
   transcription: string
 ): Promise<Partial<InterviewResult>> => {
   try {
-    // Always use process.env.API_KEY directly as per guidelines
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    const prompt = `Analyze this interview transcript for a ${config.level} ${config.jobTitle} position.
-    Mode: ${config.mode}.
-    Transcript: "${transcription}"
+    const prompt = `You are a professional interview coach. Evaluate this ${config.level} ${config.jobTitle} interview (${config.mode} mode).
 
-    Provide numeric scores (0-100) and specific actionable feedback. If the transcript is empty, provide baseline scores.`;
+Transcript:
+"${transcription}"
+
+Score the candidate 0-100 in each category. If the transcript is empty or very short, provide fair baseline scores around 50.
+
+Categories:
+- communication: clarity of speech, vocabulary, articulation
+- confidence: tone, assertiveness, self-assurance
+- technicalAccuracy: correctness of domain knowledge and facts
+- bodyLanguage: posture, eye contact, gestures (infer from context if video not available)
+- answerStructure: use of frameworks (STAR, etc.), logical flow, completeness
+- clarity: conciseness, avoiding rambling, getting to the point
+- overall: weighted average across all categories
+
+Also provide:
+- strengths: exactly 3 specific things the candidate did well
+- improvementAreas: exactly 3 specific areas that need work
+- suggestions: exactly 3 actionable recommendations the candidate can practice before their next interview`;
 
     const response = await withRetry(
       () =>
@@ -142,20 +156,21 @@ export const generateInterviewSummary = async (
                 metrics: {
                   type: Type.OBJECT,
                   properties: {
-                    communication: { type: Type.NUMBER },
-                    confidence: { type: Type.NUMBER },
-                    technicalAccuracy: { type: Type.NUMBER },
-                    bodyLanguage: { type: Type.NUMBER },
-                    overall: { type: Type.NUMBER }
+                    communication:    { type: Type.NUMBER },
+                    confidence:       { type: Type.NUMBER },
+                    technicalAccuracy:{ type: Type.NUMBER },
+                    bodyLanguage:     { type: Type.NUMBER },
+                    answerStructure:  { type: Type.NUMBER },
+                    clarity:          { type: Type.NUMBER },
+                    overall:          { type: Type.NUMBER }
                   },
-                  required: ['communication', 'confidence', 'technicalAccuracy', 'bodyLanguage', 'overall']
+                  required: ['communication', 'confidence', 'technicalAccuracy', 'bodyLanguage', 'answerStructure', 'clarity', 'overall']
                 },
-                suggestions: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING }
-                }
+                strengths:        { type: Type.ARRAY, items: { type: Type.STRING } },
+                improvementAreas: { type: Type.ARRAY, items: { type: Type.STRING } },
+                suggestions:      { type: Type.ARRAY, items: { type: Type.STRING } }
               },
-              required: ['metrics', 'suggestions']
+              required: ['metrics', 'strengths', 'improvementAreas', 'suggestions']
             }
           }
         }),
@@ -166,8 +181,10 @@ export const generateInterviewSummary = async (
   } catch (error) {
     console.error('Error generating summary:', error);
     return {
-      metrics: { communication: 50, confidence: 50, technicalAccuracy: 50, bodyLanguage: 50, overall: 50 },
-      suggestions: ['Try to provide more detail in your responses.', 'Focus on clear, concise communication.']
+      metrics: { communication: 50, confidence: 50, technicalAccuracy: 50, bodyLanguage: 50, answerStructure: 50, clarity: 50, overall: 50 },
+      strengths: ['You completed the interview session.', 'You engaged with the question prompts.', 'You showed up and practiced.'],
+      improvementAreas: ['Provide more specific examples in your answers.', 'Work on structuring answers with a clear beginning, middle, and end.', 'Practice speaking with greater confidence and pace.'],
+      suggestions: ['Try to provide more detail in your responses.', 'Focus on clear, concise communication.', 'Use the STAR method to structure behavioral answers.']
     };
   }
 };

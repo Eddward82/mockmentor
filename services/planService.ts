@@ -3,6 +3,13 @@ import { db, auth } from './firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { persistenceService } from './persistenceService';
 
+function getStartOfMonth(): Date {
+  const d = new Date();
+  d.setDate(1);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
 export const planService = {
   async getUserPlan(): Promise<UserPlan> {
     const user = auth.currentUser;
@@ -31,26 +38,43 @@ export const planService = {
   },
 
   async getSessionCount(plan: UserPlan): Promise<number> {
-    const limits = PLAN_LIMITS[plan];
     const history = await persistenceService.getHistory();
-
-    if (limits.isLifetimeLimit) {
-      return history.length;
-    }
-
-    // Monthly count for paid plans
-    const startOfMonth = new Date();
-    startOfMonth.setDate(1);
-    startOfMonth.setHours(0, 0, 0, 0);
+    const startOfMonth = getStartOfMonth();
+    // All plans now count monthly sessions
     return history.filter((item) => new Date(item.date) >= startOfMonth).length;
+  },
+
+  async getAudioMinutesUsed(): Promise<number> {
+    const history = await persistenceService.getHistory();
+    const startOfMonth = getStartOfMonth();
+    const monthSessions = history.filter((item) => new Date(item.date) >= startOfMonth);
+    // Sum up duration (stored in seconds), convert to minutes
+    const totalSeconds = monthSessions.reduce((sum, item) => sum + (item.duration ?? 0), 0);
+    return totalSeconds / 60;
   },
 
   async canStartSession(plan: UserPlan): Promise<{ allowed: boolean; reason?: string }> {
     const limits = PLAN_LIMITS[plan];
-    const count = await this.getSessionCount(plan);
 
+    // Premium has unlimited sessions — only check audio cap
+    if (limits.sessionLimit === null) {
+      const audioUsed = await this.getAudioMinutesUsed();
+      if (audioUsed >= limits.maxAudioMinutesPerMonth) {
+        return { allowed: false, reason: 'audio_limit_reached' };
+      }
+      return { allowed: true };
+    }
+
+    // Check session count for Starter and Professional
+    const count = await this.getSessionCount(plan);
     if (count >= limits.sessionLimit) {
       return { allowed: false, reason: 'limit_reached' };
+    }
+
+    // Check audio minutes cap
+    const audioUsed = await this.getAudioMinutesUsed();
+    if (audioUsed >= limits.maxAudioMinutesPerMonth) {
+      return { allowed: false, reason: 'audio_limit_reached' };
     }
 
     return { allowed: true };

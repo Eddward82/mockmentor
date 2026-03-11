@@ -34,12 +34,8 @@ export const Settings: React.FC<SettingsProps> = ({
   const planLimits = PLAN_LIMITS[userPlan];
 
   useEffect(() => {
-    if (planLimits.isLifetimeLimit) {
-      setSessionCount(history.length);
-    } else {
-      persistenceService.getMonthlyInterviewCount().then(setSessionCount);
-    }
-  }, [history.length, planLimits.isLifetimeLimit]);
+    persistenceService.getMonthlyInterviewCount().then(setSessionCount);
+  }, [history.length]);
 
   const handleClearHistory = () => {
     onClearHistory();
@@ -99,11 +95,12 @@ export const Settings: React.FC<SettingsProps> = ({
           <div className="bg-slate-50 dark:bg-slate-700/50 rounded-2xl p-4">
             <p className="text-xs font-black uppercase tracking-widest text-slate-400 mb-1">Sessions Used</p>
             <p className="text-2xl font-black text-slate-900 dark:text-white">
-              {sessionCount}<span className="text-base font-bold text-slate-400">/{planLimits.sessionLimit}</span>
+              {sessionCount}
+              <span className="text-base font-bold text-slate-400">
+                /{planLimits.sessionLimit === null ? '∞' : planLimits.sessionLimit}
+              </span>
             </p>
-            <p className="text-[10px] font-bold text-slate-400 mt-1">
-              {planLimits.isLifetimeLimit ? 'Lifetime' : 'This month'}
-            </p>
+            <p className="text-[10px] font-bold text-slate-400 mt-1">This month</p>
           </div>
           <div className="bg-slate-50 dark:bg-slate-700/50 rounded-2xl p-4">
             <p className="text-xs font-black uppercase tracking-widest text-slate-400 mb-1">Questions/Session</p>

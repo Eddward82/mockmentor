@@ -172,19 +172,28 @@ const App: React.FC = () => {
   };
 
   const handleStartInterviewFlow = (cfg: InterviewConfig) => {
-    // Check session limit locally using already-loaded history — no Firestore call
     const limits = PLAN_LIMITS[userPlan];
-    let sessionCount: number;
-    if (limits.isLifetimeLimit) {
-      sessionCount = history.length;
-    } else {
+
+    // Check session count (null = unlimited, skip check)
+    if (limits.sessionLimit !== null) {
       const startOfMonth = new Date();
       startOfMonth.setDate(1);
       startOfMonth.setHours(0, 0, 0, 0);
-      sessionCount = history.filter((item) => new Date(item.date) >= startOfMonth).length;
+      const sessionCount = history.filter((item) => new Date(item.date) >= startOfMonth).length;
+      if (sessionCount >= limits.sessionLimit) {
+        setShowUpgradeModal(true);
+        return;
+      }
     }
 
-    if (sessionCount >= limits.sessionLimit) {
+    // Check audio minutes cap
+    const startOfMonth = new Date();
+    startOfMonth.setDate(1);
+    startOfMonth.setHours(0, 0, 0, 0);
+    const audioUsedMinutes = history
+      .filter((item) => new Date(item.date) >= startOfMonth)
+      .reduce((sum, item) => sum + (item.duration ?? 0), 0) / 60;
+    if (audioUsedMinutes >= limits.maxAudioMinutesPerMonth) {
       setShowUpgradeModal(true);
       return;
     }
@@ -222,7 +231,7 @@ const App: React.FC = () => {
 
     switch (currentView) {
       case AppView.HOME:
-        return <Home onStart={() => setCurrentView(AppView.SETUP)} onGoTerms={() => setCurrentView(AppView.TERMS)} onGoPrivacy={() => setCurrentView(AppView.PRIVACY)} />;
+        return <Home onStart={() => setCurrentView(AppView.SETUP)} onGoDashboard={() => setCurrentView(AppView.DASHBOARD)} onGoTerms={() => setCurrentView(AppView.TERMS)} onGoPrivacy={() => setCurrentView(AppView.PRIVACY)} />;
       case AppView.TERMS:
         return <TermsOfService onGoHome={() => setCurrentView(AppView.HOME)} />;
       case AppView.PRIVACY:
@@ -250,7 +259,7 @@ const App: React.FC = () => {
           <Login />
         );
       default:
-        return <Home onStart={() => setCurrentView(AppView.SETUP)} />;
+        return <Home onStart={() => setCurrentView(AppView.SETUP)} onGoDashboard={() => setCurrentView(AppView.DASHBOARD)} />;
     }
   };
 

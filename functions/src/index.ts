@@ -5,62 +5,60 @@ import { getFirestore } from 'firebase-admin/firestore';
 
 initializeApp();
 
-// Map your Lemon Squeezy variant IDs to internal plan names
-// Both monthly and yearly variants for the same plan map to the same plan name
-const VARIANT_TO_PLAN: Record<string, 'professional' | 'premium'> = {
-  '1314338': 'professional', // Professional Monthly
-  '1314371': 'professional', // Professional Yearly
-  '1314369': 'premium', // Premium Monthly
-  '1314506': 'premium', // Premium Yearly
+// Map Polar product IDs to internal plan names
+const PRODUCT_TO_PLAN: Record<string, 'professional' | 'premium'> = {
+  '5f157d56-826b-48b7-8657-241cb41419f4': 'professional', // Professional Monthly
+  '1a816832-c376-4833-b1ca-099108cbfe24': 'professional', // Professional Yearly
+  '261673be-c002-4cc7-bd10-402a1ec17db6': 'premium',      // Premium Monthly
+  '1e9ed26c-4385-42d8-96ca-1bdbd4b5b16d': 'premium',      // Premium Yearly
 };
 
-export const lemonWebhook = onRequest(
+export const polarWebhook = onRequest(
   {
-    secrets: ['LEMON_SQUEEZY_WEBHOOK_SECRET'],
+    secrets: ['POLAR_WEBHOOK_SECRET'],
   },
   async (req, res) => {
-    // Only accept POST
     if (req.method !== 'POST') {
       res.status(405).send('Method Not Allowed');
       return;
     }
 
-    // Get the webhook secret
-    const webhookSecret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
+    const webhookSecret = process.env.POLAR_WEBHOOK_SECRET;
     if (!webhookSecret) {
-      console.error('LEMON_SQUEEZY_WEBHOOK_SECRET not configured');
+      console.error('POLAR_WEBHOOK_SECRET not configured');
       res.status(500).send('Server misconfigured');
       return;
     }
 
-    // Verify webhook signature
+    // Verify Polar webhook signature (HMAC SHA-256)
     const rawBody = (req as any).rawBody as Buffer;
-    const signature = req.headers['x-signature'] as string;
+    const signature = req.headers['webhook-signature'] as string;
 
     if (!rawBody || !signature) {
       res.status(400).send('Missing body or signature');
       return;
     }
 
+    // Polar sends: "v1=<hex_digest>"
+    const sigHex = signature.startsWith('v1=') ? signature.slice(3) : signature;
     const hmac = crypto.createHmac('sha256', webhookSecret);
-    const digest = Buffer.from(hmac.update(rawBody).digest('hex'), 'utf8');
-    const sigBuffer = Buffer.from(signature, 'utf8');
+    const digest = hmac.update(rawBody).digest('hex');
 
-    if (digest.length !== sigBuffer.length || !crypto.timingSafeEqual(digest, sigBuffer)) {
+    if (!crypto.timingSafeEqual(Buffer.from(digest, 'utf8'), Buffer.from(sigHex, 'utf8'))) {
       res.status(401).send('Invalid signature');
       return;
     }
 
-    // Parse the event
     const payload = JSON.parse(rawBody.toString('utf8'));
-    const eventName: string = payload.meta?.event_name;
-    const customData = payload.meta?.custom_data ?? {};
-    const uid: string | undefined = customData.uid;
+    const eventType: string = payload.type ?? '';
+    const data = payload.data ?? {};
 
-    console.log(`Lemon Squeezy webhook: ${eventName}, uid: ${uid}`);
+    // Extract Firebase uid from metadata
+    const uid: string | undefined = data.metadata?.uid ?? data.subscription?.metadata?.uid;
+
+    console.log(`Polar webhook: ${eventType}, uid: ${uid}`);
 
     if (!uid) {
-      // No uid means we can't identify the user — acknowledge but skip
       res.status(200).send('No uid, ignored');
       return;
     }
@@ -68,28 +66,24 @@ export const lemonWebhook = onRequest(
     const db = getFirestore();
     const planRef = db.doc(`users/${uid}/profile/plan`);
 
-    if (eventName === 'subscription_created' || eventName === 'subscription_updated') {
-      const attrs = payload.data?.attributes ?? {};
-      const status: string = attrs.status;
-      const variantId: string = String(attrs.variant_id ?? '');
-      const plan = VARIANT_TO_PLAN[variantId];
+    if (eventType === 'subscription.created' || eventType === 'subscription.updated') {
+      const status: string = data.status ?? '';
+      const productId: string = data.product_id ?? '';
+      const plan = PRODUCT_TO_PLAN[productId];
 
       if (status === 'active' && plan) {
         await planRef.set(
           {
             plan,
-            lsSubscriptionId: String(payload.data?.id ?? ''),
-            lsVariantId: variantId,
+            polarSubscriptionId: data.id ?? '',
+            polarProductId: productId,
             updatedAt: new Date().toISOString(),
           },
           { merge: true }
         );
         console.log(`Plan updated to ${plan} for user ${uid}`);
       }
-    } else if (
-      eventName === 'subscription_cancelled' ||
-      eventName === 'subscription_expired'
-    ) {
+    } else if (eventType === 'subscription.revoked') {
       await planRef.set(
         { plan: 'starter', updatedAt: new Date().toISOString() },
         { merge: true }
@@ -97,7 +91,6 @@ export const lemonWebhook = onRequest(
       console.log(`Plan downgraded to starter for user ${uid}`);
     }
 
-    // Always return 200 to prevent Lemon Squeezy from retrying
     res.status(200).send('OK');
   }
 );
