@@ -19,6 +19,7 @@ interface InterviewSimulationProps {
 
 type SimulationState = 'generating' | 'preparation' | 'active' | 'analyzing';
 type ConnectionState = 'connecting' | 'open' | 'degraded' | 'reconnecting' | 'closed';
+type MicHealthState = 'initializing' | 'ready' | 'waiting_for_speech' | 'recovering' | 'error';
 
 const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
 const geminiModel = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
@@ -37,6 +38,8 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
   const [activeQuestion, setActiveQuestion] = useState<InterviewQuestion | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionState, setConnectionState] = useState<ConnectionState>('closed');
+  const [micHealth, setMicHealth] = useState<MicHealthState>('initializing');
+  const micHealthRef = useRef<MicHealthState>('initializing');
   const [isPaused, setIsPaused] = useState(false);
   const isPausedRef = useRef(false);
   const [transcription, setTranscription] = useState<string[]>([]);
@@ -79,6 +82,11 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
   // Audio queue: buffer PCM chunks and flush every 150ms to smooth network jitter
   const audioQueueRef = useRef<string[]>([]);
   const audioFlushIntervalRef = useRef<number | null>(null);
+  const audioHealthIntervalRef = useRef<number | null>(null);
+  const lastAudioCaptureAtRef = useRef<number>(0);
+  const lastAudioSendAtRef = useRef<number>(0);
+  const lastInputTranscriptAtRef = useRef<number>(0);
+  const micRecoveryAttemptedRef = useRef(false);
   // Session ID for Firestore transcript persistence (one per question)
   const sessionIdRef = useRef<string>('');
   // Prevent reconnect attempts after intentional close
@@ -101,6 +109,13 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
       reason,
     });
   }, [buildEventContext]);
+
+  const setMicHealthSafe = useCallback((nextState: MicHealthState) => {
+    if (micHealthRef.current !== nextState) {
+      micHealthRef.current = nextState;
+      setMicHealth(nextState);
+    }
+  }, []);
 
   // Persist a single transcript message to Firestore (fire-and-forget, never throws)
   const persistTranscriptLine = useCallback((role: 'user' | 'ai', text: string) => {
@@ -125,6 +140,7 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
     if (aiPlaybackEndTimerRef.current) clearTimeout(aiPlaybackEndTimerRef.current);
     if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
     if (audioFlushIntervalRef.current) clearInterval(audioFlushIntervalRef.current);
+    if (audioHealthIntervalRef.current) clearInterval(audioHealthIntervalRef.current);
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     if (preAcquiredStreamRef.current) preAcquiredStreamRef.current.getTracks().forEach((t) => t.stop());
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
@@ -132,8 +148,9 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
     sourcesRef.current.clear();
     audioQueueRef.current = [];
     isAISpeakingRef.current = false;
+    setMicHealthSafe('initializing');
     setConnectionState('closed');
-  }, []);
+  }, [setMicHealthSafe]);
 
   // Rotate loading messages
   useEffect(() => {
@@ -261,9 +278,15 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
 
       // Reuse pre-acquired stream or acquire with echo cancellation
       let stream: MediaStream;
-      if (streamRef.current && streamRef.current.getAudioTracks().some((track) => track.readyState === 'live')) {
+      if (
+        streamRef.current
+        && streamRef.current.getAudioTracks().some((track) => track.readyState === 'live' && track.enabled)
+      ) {
         stream = streamRef.current;
-      } else if (preAcquiredStreamRef.current) {
+      } else if (
+        preAcquiredStreamRef.current
+        && preAcquiredStreamRef.current.getAudioTracks().some((track) => track.readyState === 'live' && track.enabled)
+      ) {
         stream = preAcquiredStreamRef.current;
         preAcquiredStreamRef.current = null;
       } else {
@@ -322,11 +345,21 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
 
       const inputAudioCtx = new AudioContext({ sampleRate: 16000 });
       const outputAudioCtx = new AudioContext({ sampleRate: 24000 });
+      if (inputAudioCtx.state === 'suspended') {
+        await inputAudioCtx.resume().catch(() => {
+          emitLiveSessionEvent('audio_context_resume_failure', buildEventContext());
+        });
+      }
 
       sessionOpenRef.current = false;
       sessionRef.current = null;
       isAISpeakingRef.current = false;
       interviewFinishedRef.current = false;
+      lastAudioCaptureAtRef.current = Date.now();
+      lastAudioSendAtRef.current = Date.now();
+      lastInputTranscriptAtRef.current = Date.now();
+      micRecoveryAttemptedRef.current = false;
+      setMicHealthSafe('initializing');
       if (!isReconnect || !sessionIdRef.current) {
         // New session ID for Firestore transcript bucket
         sessionIdRef.current = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -388,6 +421,10 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
               const int16 = new Int16Array(inputData.length);
               for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
               audioQueueRef.current.push(encode(new Uint8Array(int16.buffer)));
+              lastAudioCaptureAtRef.current = Date.now();
+              if (micHealthRef.current !== 'recovering') {
+                setMicHealthSafe('ready');
+              }
             };
             source.connect(scriptProcessor);
             scriptProcessor.connect(inputAudioCtx.destination);
@@ -399,6 +436,7 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
                 const chunk = audioQueueRef.current.shift()!;
                 try {
                   sessionRef.current.sendRealtimeInput({ media: { data: chunk, mimeType: 'audio/pcm;rate=16000' } });
+                  lastAudioSendAtRef.current = Date.now();
                 } catch {
                   emitLiveSessionEvent('realtime_send_failure', buildEventContext());
                   audioQueueRef.current = [];
@@ -407,6 +445,35 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
                 }
               }
             }, 150);
+
+            audioHealthIntervalRef.current = window.setInterval(() => {
+              if (!sessionOpenRef.current || !sessionRef.current || isPausedRef.current) return;
+              const now = Date.now();
+              const captureGapMs = now - lastAudioCaptureAtRef.current;
+              const sendGapMs = now - lastAudioSendAtRef.current;
+              const transcriptGapMs = now - lastInputTranscriptAtRef.current;
+
+              if (captureGapMs > 6000 || sendGapMs > 6000) {
+                setMicHealthSafe('recovering');
+                if (!micRecoveryAttemptedRef.current) {
+                  micRecoveryAttemptedRef.current = true;
+                  emitLiveSessionEvent('mic_stall_detected', {
+                    ...buildEventContext(),
+                    captureGapMs,
+                    sendGapMs,
+                    transcriptGapMs,
+                  });
+                  scheduleReconnect('mic_stall');
+                }
+                return;
+              }
+
+              if (transcriptGapMs > 9000) {
+                setMicHealthSafe('waiting_for_speech');
+              } else {
+                setMicHealthSafe('ready');
+              }
+            }, 2000);
 
             // --- Heartbeat: send a silent audio frame every 20s to keep session alive ---
             heartbeatIntervalRef.current = window.setInterval(() => {
@@ -455,6 +522,8 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
             if (inText) {
               setTranscription((p: string[]) => [...p, `User: ${inText}`]);
               persistTranscriptLine('user', inText);
+              lastInputTranscriptAtRef.current = Date.now();
+              setMicHealthSafe('ready');
             }
 
             // Process audio parts — mark AI as speaking while audio plays
@@ -495,6 +564,7 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
             }
           },
           onerror: (e: any) => {
+            setMicHealthSafe('error');
             setConnectionStateWithEvent('degraded', 'socket_error');
             console.error('Gemini Live error:', e);
           },
@@ -505,6 +575,8 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
             audioQueueRef.current = [];
             if (heartbeatIntervalRef.current) { clearInterval(heartbeatIntervalRef.current); heartbeatIntervalRef.current = null; }
             if (audioFlushIntervalRef.current) { clearInterval(audioFlushIntervalRef.current); audioFlushIntervalRef.current = null; }
+            if (audioHealthIntervalRef.current) { clearInterval(audioHealthIntervalRef.current); audioHealthIntervalRef.current = null; }
+            setMicHealthSafe('initializing');
             setConnectionStateWithEvent('closed', e?.reason || 'socket_closed');
             console.warn('Gemini Live closed — code:', e?.code, 'reason:', e?.reason);
             // Reconnect only if the interview is still in progress and close was unexpected
@@ -516,6 +588,7 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
       });
       sessionPromiseRef.current = sessionPromise;
     } catch (err) {
+      setMicHealthSafe('error');
       setConnectionStateWithEvent('degraded', 'connect_failed');
       console.error('Live session error:', err);
       const message = err instanceof Error ? err.message : String(err);
@@ -734,6 +807,21 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
 
   const isLastQuestion = currentQuestionIndex >= questions.length - 1;
   const hasMultipleQuestions = questions.length > 1;
+  const recordingLabel = isConnecting
+    ? 'Establishing...'
+    : isPaused
+      ? 'Paused'
+      : micHealth === 'recovering'
+        ? 'Recovering Mic...'
+        : 'Recording Active';
+
+  const micHint = micHealth === 'waiting_for_speech'
+    ? 'Mic ready, waiting for speech'
+    : micHealth === 'recovering'
+      ? 'Mic or transcription stalled, reconnecting'
+      : micHealth === 'error'
+        ? 'Mic pipeline degraded'
+        : 'Mic streaming healthy';
 
   return (
     <div className="flex flex-col lg:flex-row gap-6 p-4 md:p-6 h-[calc(100vh-80px)] overflow-hidden">
@@ -799,9 +887,9 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
             <div className="hidden sm:block">
               <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Simulation Mode</p>
               <p className="font-black text-slate-800 dark:text-white text-lg" aria-live="polite">
-                {isConnecting ? 'Establishing...' : isPaused ? 'Paused' : 'Recording Active'}
+                {recordingLabel}
               </p>
-              <p className="text-xs font-bold text-slate-500">Transport: {connectionState}</p>
+              <p className="text-xs font-bold text-slate-500">Transport: {connectionState} · {micHint}</p>
             </div>
             {questionTimeRemaining != null && (
               <div
