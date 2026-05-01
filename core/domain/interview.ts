@@ -60,6 +60,13 @@ export interface LiveAnalysis {
   confidenceIndicator: number;
 }
 
+export interface UserPreferences {
+  jobTitle: string;
+  level: ExperienceLevel;
+  mode: InterviewMode;
+  defaultQuestionCount: number;
+}
+
 export enum AppView {
   HOME = 'home',
   SETUP = 'setup',
@@ -68,5 +75,8 @@ export enum AppView {
   DASHBOARD = 'dashboard',
   SETTINGS = 'settings',
   TERMS = 'terms',
-  PRIVACY = 'privacy'
+  PRIVACY = 'privacy',
+  ONBOARDING = 'onboarding',
+  ADMIN = 'admin',
+  EMAIL_VERIFICATION = 'email-verification'
 }

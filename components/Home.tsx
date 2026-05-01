@@ -302,7 +302,7 @@ export const Home: React.FC<HomeProps> = ({ onStart, onGoDashboard, onGoTerms, o
               <ul className="space-y-4 mb-10">
                 <li className="flex items-start gap-3">
                   <svg className="w-5 h-5 text-green-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>
-                  <span className="text-sm font-bold text-slate-600 dark:text-slate-300">Unlimited sessions</span>
+                  <span className="text-sm font-bold text-slate-600 dark:text-slate-300">{PLAN_LIMITS.premium.sessionLimit} sessions per month</span>
                 </li>
                 <li className="flex items-start gap-3">
                   <svg className="w-5 h-5 text-green-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" /></svg>

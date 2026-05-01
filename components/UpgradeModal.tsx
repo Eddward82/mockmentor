@@ -1,6 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { UserPlan, PLAN_LIMITS } from '../types';
 import { openCheckout, type BillingInterval } from '../services/polarService';
+import { db, auth } from '../services/firebase';
+import { doc, onSnapshot } from 'firebase/firestore';
 
 interface UpgradeModalProps {
   userPlan: UserPlan;
@@ -81,10 +83,28 @@ const PlanCard: React.FC<PlanCardProps> = ({ plan, price, priceSuffix, features,
 
 export const UpgradeModal: React.FC<UpgradeModalProps> = ({ userPlan, onClose }) => {
   const limits = PLAN_LIMITS[userPlan];
-  const activating = false;
   const [billingInterval, setBillingInterval] = useState<BillingInterval>('monthly');
+  const [activating, setActivating] = useState(false);
+
+  // Listen for plan upgrade in Firestore — auto-close modal when plan changes
+  useEffect(() => {
+    const user = auth.currentUser;
+    if (!user) return;
+    const planRef = doc(db, 'users', user.uid, 'profile', 'plan');
+    const unsub = onSnapshot(planRef, (snap) => {
+      if (!snap.exists()) return;
+      const newPlan = snap.data().plan as UserPlan;
+      if (newPlan !== userPlan) {
+        // Plan upgraded — show success briefly then close
+        setActivating(false);
+        setTimeout(onClose, 1500);
+      }
+    });
+    return () => unsub();
+  }, [userPlan, onClose]);
 
   const handleUpgrade = (plan: 'professional' | 'premium') => {
+    setActivating(true);
     openCheckout(plan, billingInterval);
   };
 
@@ -146,7 +166,7 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({ userPlan, onClose })
           <PlanCard
             plan="starter"
             price="Free"
-            features={['5 sessions/month', 'Up to 3 questions', 'Basic feedback']}
+            features={['2 sessions/month', 'Up to 3 questions', 'Basic feedback']}
             isCurrent={userPlan === 'starter'}
             onUpgrade={handleUpgrade}
             activating={activating}
@@ -164,7 +184,7 @@ export const UpgradeModal: React.FC<UpgradeModalProps> = ({ userPlan, onClose })
             plan="premium"
             price={billingInterval === 'monthly' ? '$49' : '$470'}
             priceSuffix={billingInterval === 'monthly' ? '/mo' : '/yr'}
-            features={['Unlimited sessions', 'Up to 10 questions', 'Advanced analytics', 'Priority support']}
+            features={['60 sessions per month', 'Up to 10 questions', 'Advanced analytics', 'Priority support']}
             isCurrent={userPlan === 'premium'}
             onUpgrade={handleUpgrade}
             activating={activating}

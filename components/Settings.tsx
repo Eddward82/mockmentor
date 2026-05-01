@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { type User } from 'firebase/auth';
-import { UserPlan, PLAN_LIMITS, InterviewResult } from '../types';
+import { type User, deleteUser, reauthenticateWithCredential, EmailAuthProvider, GoogleAuthProvider, reauthenticateWithPopup } from 'firebase/auth';
+import { UserPlan, PLAN_LIMITS, InterviewResult, UserPreferences, ExperienceLevel, InterviewMode } from '../types';
 import { persistenceService } from '../services/persistenceService';
+import { db } from '../services/firebase';
+import { collection, getDocs, deleteDoc } from 'firebase/firestore';
 
 interface SettingsProps {
   user: User;
@@ -11,6 +13,8 @@ interface SettingsProps {
   onSignOut: () => void;
   history: InterviewResult[];
   onClearHistory: () => void;
+  userPreferences: UserPreferences | null;
+  onSavePreferences: (prefs: UserPreferences) => Promise<void>;
 }
 
 const PLAN_BADGE_STYLES: Record<UserPlan, string> = {
@@ -27,11 +31,40 @@ export const Settings: React.FC<SettingsProps> = ({
   onSignOut,
   history,
   onClearHistory,
+  userPreferences,
+  onSavePreferences,
 }) => {
   const [sessionCount, setSessionCount] = useState(0);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [prefJobTitle, setPrefJobTitle] = useState(userPreferences?.jobTitle ?? '');
+  const [prefLevel, setPrefLevel] = useState<ExperienceLevel>(userPreferences?.level ?? ExperienceLevel.MID);
+  const [prefMode, setPrefMode] = useState<InterviewMode>(userPreferences?.mode ?? InterviewMode.BEHAVIORAL);
+  const [prefQuestionCount, setPrefQuestionCount] = useState(userPreferences?.defaultQuestionCount ?? 3);
+  const [prefSaving, setPrefSaving] = useState(false);
+  const [prefSaved, setPrefSaved] = useState(false);
 
   const planLimits = PLAN_LIMITS[userPlan];
+
+  useEffect(() => {
+    if (userPreferences) {
+      setPrefJobTitle(userPreferences.jobTitle);
+      setPrefLevel(userPreferences.level);
+      setPrefMode(userPreferences.mode);
+      setPrefQuestionCount(userPreferences.defaultQuestionCount);
+    }
+  }, [userPreferences]);
+
+  const handleSavePreferences = async () => {
+    setPrefSaving(true);
+    await onSavePreferences({ jobTitle: prefJobTitle.trim() || 'Software Engineer', level: prefLevel, mode: prefMode, defaultQuestionCount: prefQuestionCount });
+    setPrefSaving(false);
+    setPrefSaved(true);
+    setTimeout(() => setPrefSaved(false), 2000);
+  };
 
   useEffect(() => {
     persistenceService.getMonthlyInterviewCount().then(setSessionCount);
@@ -40,6 +73,46 @@ export const Settings: React.FC<SettingsProps> = ({
   const handleClearHistory = () => {
     onClearHistory();
     setShowClearConfirm(false);
+  };
+
+  const handleDeleteAccount = async () => {
+    setDeleteLoading(true);
+    setDeleteError('');
+    try {
+      // Re-authenticate first
+      const providerData = user.providerData[0];
+      if (providerData?.providerId === 'google.com') {
+        await reauthenticateWithPopup(user, new GoogleAuthProvider());
+      } else if (deletePassword) {
+        const credential = EmailAuthProvider.credential(user.email!, deletePassword);
+        await reauthenticateWithCredential(user, credential);
+      } else {
+        setDeleteError('Please enter your password to confirm deletion.');
+        setDeleteLoading(false);
+        return;
+      }
+
+      // Delete all Firestore data under users/{uid}
+      const subcollections = ['interviews', 'sessions', 'profile'];
+      for (const sub of subcollections) {
+        const snap = await getDocs(collection(db, 'users', user.uid, sub));
+        await Promise.all(snap.docs.map((d) => deleteDoc(d.ref)));
+      }
+
+      // Delete Firebase Auth account
+      await deleteUser(user);
+      // onSignOut will be triggered by onAuthStateChanged
+    } catch (e: any) {
+      if (e.code === 'auth/wrong-password' || e.code === 'auth/invalid-credential') {
+        setDeleteError('Incorrect password. Please try again.');
+      } else if (e.code === 'auth/requires-recent-login') {
+        setDeleteError('Please sign out and sign back in before deleting your account.');
+      } else {
+        setDeleteError('Failed to delete account. Please try again.');
+      }
+    } finally {
+      setDeleteLoading(false);
+    }
   };
 
   const handleExportData = () => {
@@ -125,6 +198,63 @@ export const Settings: React.FC<SettingsProps> = ({
         )}
       </div>
 
+      {/* Interview Defaults Section */}
+      <div className="bg-white dark:bg-slate-800 rounded-3xl border border-slate-100 dark:border-slate-700 p-8 mb-6">
+        <h2 className="text-xs font-black uppercase tracking-widest text-slate-400 mb-6">Interview Defaults</h2>
+        <div className="space-y-5">
+          <div>
+            <label className="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Target Job Title</label>
+            <input
+              type="text"
+              value={prefJobTitle}
+              onChange={(e) => setPrefJobTitle(e.target.value)}
+              placeholder="e.g. Software Engineer"
+              className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-600 dark:bg-slate-700 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all text-sm"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Experience Level</label>
+            <div className="flex gap-2">
+              {Object.values(ExperienceLevel).map((lvl) => (
+                <button key={lvl} onClick={() => setPrefLevel(lvl)}
+                  className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all ${prefLevel === lvl ? 'bg-blue-600 text-white' : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'}`}>
+                  {lvl}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Interview Type</label>
+            <div className="flex gap-2">
+              {Object.values(InterviewMode).map((m) => (
+                <button key={m} onClick={() => setPrefMode(m)}
+                  className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all ${prefMode === m ? 'bg-blue-600 text-white' : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'}`}>
+                  {m}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-2">Default Questions per Session</label>
+            <div className="flex gap-2">
+              {[1, 2, 3, 4, 5].filter((n) => n <= planLimits.maxQuestionsPerSession).map((n) => (
+                <button key={n} onClick={() => setPrefQuestionCount(n)}
+                  className={`w-10 h-10 rounded-xl text-sm font-black transition-all ${prefQuestionCount === n ? 'bg-blue-600 text-white' : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'}`}>
+                  {n}
+                </button>
+              ))}
+            </div>
+          </div>
+          <button
+            onClick={handleSavePreferences}
+            disabled={prefSaving}
+            className="px-6 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-60"
+          >
+            {prefSaved ? 'Saved!' : prefSaving ? 'Saving...' : 'Save Defaults'}
+          </button>
+        </div>
+      </div>
+
       {/* Preferences Section */}
       <div className="bg-white dark:bg-slate-800 rounded-3xl border border-slate-100 dark:border-slate-700 p-8 mb-6">
         <h2 className="text-xs font-black uppercase tracking-widest text-slate-400 mb-6">Preferences</h2>
@@ -180,7 +310,7 @@ export const Settings: React.FC<SettingsProps> = ({
               <div>
                 <p className="text-sm font-bold text-slate-700 dark:text-slate-300">Clear Interview History</p>
                 <p className="text-xs font-medium text-slate-400 mt-0.5">
-                  {history.length} session{history.length !== 1 ? 's' : ''} stored locally
+                  {history.length} session{history.length !== 1 ? 's' : ''} in your account
                 </p>
               </div>
               {showClearConfirm ? (
@@ -210,6 +340,58 @@ export const Settings: React.FC<SettingsProps> = ({
             </div>
           </div>
         </div>
+      </div>
+
+      {/* Danger Zone */}
+      <div className="bg-white dark:bg-slate-800 rounded-3xl border border-red-100 dark:border-red-900/40 p-8 mb-6">
+        <h2 className="text-xs font-black uppercase tracking-widest text-red-400 mb-6">Danger Zone</h2>
+        {!showDeleteConfirm ? (
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-bold text-slate-700 dark:text-slate-300">Delete Account</p>
+              <p className="text-xs font-medium text-slate-400 mt-0.5">Permanently delete your account and all data</p>
+            </div>
+            <button
+              onClick={() => { setShowDeleteConfirm(true); setDeleteError(''); setDeletePassword(''); }}
+              className="px-4 py-2 rounded-xl text-xs font-black uppercase tracking-widest bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-950/50 transition-colors"
+            >
+              Delete
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <p className="text-sm font-bold text-red-600 dark:text-red-400">
+              This will permanently delete your account and all interview history. This cannot be undone.
+            </p>
+            {user.providerData[0]?.providerId !== 'google.com' && (
+              <input
+                type="password"
+                placeholder="Enter your password to confirm"
+                value={deletePassword}
+                onChange={(e) => setDeletePassword(e.target.value)}
+                className="w-full px-4 py-3 rounded-xl border border-red-200 dark:border-red-800 dark:bg-slate-700 dark:text-white focus:ring-2 focus:ring-red-500 focus:border-transparent transition-all text-sm"
+              />
+            )}
+            {deleteError && (
+              <p className="text-xs font-bold text-red-500">{deleteError}</p>
+            )}
+            <div className="flex gap-3">
+              <button
+                onClick={handleDeleteAccount}
+                disabled={deleteLoading}
+                className="flex-1 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest bg-red-600 text-white hover:bg-red-700 transition-colors disabled:opacity-60"
+              >
+                {deleteLoading ? 'Deleting...' : 'Yes, Delete My Account'}
+              </button>
+              <button
+                onClick={() => setShowDeleteConfirm(false)}
+                className="flex-1 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Sign Out */}

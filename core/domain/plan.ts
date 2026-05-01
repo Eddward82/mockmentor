@@ -11,7 +11,7 @@ export interface PlanLimits {
 
 export const PLAN_LIMITS: Record<UserPlan, PlanLimits> = {
   starter: {
-    sessionLimit: 5,
+    sessionLimit: 2,          // 2 sessions/month — ~$0.36 API cost worst-case (3q×~$0.18), loss-leader for free tier
     isLifetimeLimit: false,
     maxQuestionsPerSession: 3,
     questionTimeLimitCap: 90,
@@ -19,7 +19,7 @@ export const PLAN_LIMITS: Record<UserPlan, PlanLimits> = {
     label: 'Starter'
   },
   professional: {
-    sessionLimit: 20,
+    sessionLimit: 20,         // 20 sessions/month — ~$4 API cost vs $19 revenue (79% margin)
     isLifetimeLimit: false,
     maxQuestionsPerSession: 5,
     questionTimeLimitCap: 120,
@@ -27,7 +27,7 @@ export const PLAN_LIMITS: Record<UserPlan, PlanLimits> = {
     label: 'Professional'
   },
   premium: {
-    sessionLimit: null,
+    sessionLimit: 60,         // 60 sessions/month soft cap — ~$24 API cost vs $49 revenue (51% margin)
     isLifetimeLimit: false,
     maxQuestionsPerSession: 10,
     questionTimeLimitCap: 180,

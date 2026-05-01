@@ -1,4 +1,5 @@
 import { UserPlan } from '../../core/domain/plan';
+import { UserPreferences } from '../../core/domain/interview';
 import { db, auth } from '../../services/firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { PlanPort } from '../../application/ports/plan-port';
@@ -28,6 +29,22 @@ class FirestorePlanRepository implements PlanPort {
 
     const profileRef = doc(db, 'users', user.uid, 'profile', 'plan');
     await setDoc(profileRef, { plan }, { merge: true });
+  }
+
+  async getPreferences(uid: string): Promise<UserPreferences | null> {
+    try {
+      const prefRef = doc(db, 'users', uid, 'profile', 'preferences');
+      const snap = await getDoc(prefRef);
+      if (snap.exists()) return snap.data() as UserPreferences;
+    } catch (e) {
+      console.error('Error fetching preferences:', e);
+    }
+    return null;
+  }
+
+  async savePreferences(uid: string, prefs: UserPreferences): Promise<void> {
+    const prefRef = doc(db, 'users', uid, 'profile', 'preferences');
+    await setDoc(prefRef, prefs);
   }
 }
 

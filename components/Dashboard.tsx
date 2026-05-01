@@ -80,7 +80,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ history, onStartNew }) => 
     { subject: 'Technical',     A: latest.metrics.technicalAccuracy, fullMark: 100 },
     { subject: 'Structure',     A: latest.metrics.answerStructure ?? 0, fullMark: 100 },
     { subject: 'Clarity',       A: latest.metrics.clarity ?? 0, fullMark: 100 },
-    { subject: 'Body Language', A: latest.metrics.bodyLanguage, fullMark: 100 },
+    { subject: 'Delivery', A: latest.metrics.bodyLanguage, fullMark: 100 },
   ];
 
   const trendData = [...history].reverse().map((h: InterviewResult) => ({
@@ -102,7 +102,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ history, onStartNew }) => 
   };
 
   return (
-    <div className="max-w-6xl mx-auto py-10 px-6 space-y-8">
+    <div className="max-w-6xl mx-auto py-6 md:py-10 px-4 md:px-6 space-y-8">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div>
           <h2 className="text-3xl font-black text-slate-900 dark:text-white">Progress Tracker</h2>
@@ -201,7 +201,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ history, onStartNew }) => 
                 <th className="text-left py-4 px-2 text-xs font-black text-slate-400 uppercase tracking-widest">
                   Score
                 </th>
-                <th className="text-left py-4 px-2 text-xs font-black text-slate-400 uppercase tracking-widest">
+                <th className="hidden sm:table-cell text-left py-4 px-2 text-xs font-black text-slate-400 uppercase tracking-widest">
                   Date
                 </th>
                 <th className="text-right py-4 px-2 text-xs font-black text-slate-400 uppercase tracking-widest">
@@ -230,8 +230,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ history, onStartNew }) => 
                       </span>
                     </div>
                   </td>
-                  <td className="py-5 px-2 text-sm font-medium text-slate-500">
-                    {new Date(item.date).toLocaleDateString()}
+                  <td className="hidden sm:table-cell py-5 px-2 text-sm font-medium text-slate-500">
+                    <p>{new Date(item.date).toLocaleDateString()}</p>
+                    <p className="text-xs text-slate-400">{new Date(item.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · {formatDuration(item.duration)}</p>
                   </td>
                   <td className="py-5 px-2 text-right">
                     <button
@@ -279,7 +280,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ history, onStartNew }) => 
           <div
             ref={modalRef}
             tabIndex={-1}
-            className="bg-white dark:bg-slate-800 rounded-3xl max-w-3xl w-full max-h-[90vh] overflow-hidden shadow-2xl outline-none"
+            className="bg-white dark:bg-slate-800 rounded-3xl max-w-3xl w-full max-h-[85vh] overflow-hidden shadow-2xl outline-none mx-4"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Modal Header */}
@@ -311,12 +312,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ history, onStartNew }) => 
                 <h4 className="text-xs font-black uppercase text-slate-400 tracking-widest mb-4">
                   Performance Metrics
                 </h4>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
                   {[
                     { label: 'Communication',    value: selectedSession.metrics.communication },
                     { label: 'Confidence',        value: selectedSession.metrics.confidence },
                     { label: 'Technical',         value: selectedSession.metrics.technicalAccuracy },
-                    { label: 'Body Language',     value: selectedSession.metrics.bodyLanguage },
+                    { label: 'Delivery',          value: selectedSession.metrics.bodyLanguage },
                     { label: 'Answer Structure',  value: selectedSession.metrics.answerStructure ?? '—' },
                     { label: 'Clarity',           value: selectedSession.metrics.clarity ?? '—' },
                     { label: 'Overall',           value: selectedSession.metrics.overall },

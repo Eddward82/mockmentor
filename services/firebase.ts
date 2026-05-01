@@ -3,6 +3,7 @@ import { getAuth, GoogleAuthProvider, type Auth } from 'firebase/auth';
 // Fix firestore imports by separating type and value imports
 import { getFirestore } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
+import { initializeAppCheck, ReCaptchaV3Provider } from 'firebase/app-check';
 
 const getEnv = (key: string, fallback: string): string => {
   try {
@@ -29,6 +30,18 @@ if (!getApps().length) {
 } else {
   app = getApp();
 }
+
+// App Check MUST be initialized before getAuth/getFirestore so the Firebase SDK
+// automatically attaches App Check tokens to all Firestore and Auth requests.
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore — import.meta.env is defined by Vite at build time
+const RECAPTCHA_SITE_KEY: string | undefined = import.meta.env.VITE_RECAPTCHA_SITE_KEY;
+export const appCheck = RECAPTCHA_SITE_KEY
+  ? initializeAppCheck(app, {
+      provider: new ReCaptchaV3Provider(RECAPTCHA_SITE_KEY),
+      isTokenAutoRefreshEnabled: true,
+    })
+  : null;
 
 // These initializations register the components with the 'app' instance
 export const auth: Auth = getAuth(app);

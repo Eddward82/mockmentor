@@ -354,11 +354,11 @@ export const exportAsPDF = (session: InterviewResult): void => {
   setTimeout(async () => {
     try {
       const [html2canvasModule, jsPDFModule] = await Promise.all([
-        import(/* @vite-ignore */ 'https://esm.sh/html2canvas@1.4.1'),
-        import(/* @vite-ignore */ 'https://esm.sh/jspdf@2.5.2')
+        import('html2canvas'),
+        import('jspdf')
       ]);
       const html2canvas = html2canvasModule.default;
-      const jsPDF = jsPDFModule.default || jsPDFModule.jsPDF;
+      const jsPDF = jsPDFModule.default || (jsPDFModule as any).jsPDF;
 
       const canvas = await html2canvas(iframeDoc.body, {
         scale: 2,

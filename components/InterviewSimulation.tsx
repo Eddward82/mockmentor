@@ -1,14 +1,12 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { InterviewConfig, LiveAnalysis, InterviewResult, InterviewQuestion, QuestionResponse } from '../types';
-import { ANALYTICS_FUNCTION_DECLARATION, generateInterviewSummary, generateQuestions } from '../services/geminiService';
-import { decode, encode, decodeAudioData, blobToBase64 } from '../utils/audio-utils';
-import { GoogleGenAI, Modality, LiveServerMessage, StartSensitivity, EndSensitivity, ActivityHandling } from '@google/genai';
+import { generateQuestions } from '../services/geminiService';
+import { fetchTTSBuffer as apiFetchTTSBuffer, transcribeAudio as apiTranscribeAudio, streamInterviewResponse, analyzeLive, analyzeInterview } from '../services/aiApi';
 import { VideoCapture } from './VideoCapture';
 import { FeedbackDisplay } from './FeedbackDisplay';
 import { sessionRecovery } from '../services/sessionRecovery';
 import { db, auth } from '../services/firebase';
-import { collection, addDoc, Timestamp } from 'firebase/firestore';
-import { emitLiveSessionEvent } from '../utils/live-session-observability';
+import { collection, doc, addDoc, writeBatch, Timestamp } from 'firebase/firestore';
 
 interface InterviewSimulationProps {
   config: InterviewConfig;
@@ -18,11 +16,7 @@ interface InterviewSimulationProps {
 }
 
 type SimulationState = 'generating' | 'preparation' | 'active' | 'analyzing';
-type ConnectionState = 'connecting' | 'open' | 'degraded' | 'reconnecting' | 'closed';
-type MicHealthState = 'initializing' | 'ready' | 'waiting_for_speech' | 'recovering' | 'error';
-
-const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
-const geminiModel = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+type MicState = 'idle' | 'recording' | 'processing' | 'speaking' | 'error';
 
 const LOADING_MESSAGES = [
   'Evaluating your communication style...',
@@ -33,124 +27,117 @@ const LOADING_MESSAGES = [
   'Finalizing your professional growth roadmap...'
 ];
 
+// Build the conversation-aware system prompt for Gemini
+const buildSystemPrompt = (config: InterviewConfig, question: InterviewQuestion, questionIndex: number, totalQuestions: number) =>
+  `You are a professional interview coach conducting a mock ${config.mode} interview for a ${config.level} ${config.jobTitle} position${config.company ? ` at ${config.company}` : ''}.
+
+CURRENT QUESTION: "${question.question}"
+QUESTION ${questionIndex + 1} OF ${totalQuestions}${totalQuestions === 1 ? ' (this is the only question)' : questionIndex === totalQuestions - 1 ? ' (this is the last question)' : ''}.
+
+CONVERSATION RULES:
+1. On the VERY FIRST turn, clearly ask the candidate the question above.
+2. LISTEN FULLY — after the candidate answers, respond in exactly this two-part structure:
+   a. REFLECTION — one sentence acknowledging what they said. Be specific to their answer.
+   b. FOLLOW-UP — one targeted follow-up question OR a brief closing remark if no follow-up is needed.
+3. Keep your entire response under 3 sentences. Do not over-explain.
+4. Do NOT ask multiple questions at once.
+5. Do NOT repeat the original question unless the candidate asks.
+6. NEVER mention moving to another question or suggest there are more questions unless the session explicitly has multiple questions.
+
+TONE: Professional, encouraging, concise. You are a human interviewer — warm but focused.`;
+
 export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config, onFinish, onError, questionTimeLimitCap }) => {
   const [simState, setSimState] = useState<SimulationState>('generating');
   const [activeQuestion, setActiveQuestion] = useState<InterviewQuestion | null>(null);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [connectionState, setConnectionState] = useState<ConnectionState>('closed');
-  const [micHealth, setMicHealth] = useState<MicHealthState>('initializing');
-  const micHealthRef = useRef<MicHealthState>('initializing');
+  const [micState, setMicState] = useState<MicState>('idle');
   const [isPaused, setIsPaused] = useState(false);
-  const isPausedRef = useRef(false);
   const [transcription, setTranscription] = useState<string[]>([]);
   const [loadingMsgIdx, setLoadingMsgIdx] = useState(0);
+  const [isAISpeaking, setIsAISpeaking] = useState(false);
+  const [mobileTranscriptOpen, setMobileTranscriptOpen] = useState(false);
   const [liveAnalysis, setLiveAnalysis] = useState<LiveAnalysis>({
     sentiment: 'Focused',
-    bodyLanguageTip: 'Adjusting camera...',
+    bodyLanguageTip: 'Maintain eye contact with the camera',
     confidenceIndicator: 100
   });
 
-  // Per-question timer state
-  const [questionTimeRemaining, setQuestionTimeRemaining] = useState<number | null>(null);
-  const [showQuestionTimeWarning, setShowQuestionTimeWarning] = useState(false);
+  // Turn budget — limits API calls per question (1 answer + follow-ups)
+  const MAX_TURNS_PER_QUESTION = 4;
+  const [turnsUsed, setTurnsUsed] = useState(0);
+  const turnsUsedRef = useRef(0);
+  const turnBudgetExhausted = turnsUsed >= MAX_TURNS_PER_QUESTION;
+
   const questionTimerRef = useRef<number | null>(null);
-  const autoAdvanceCalledRef = useRef(false);
+
+  // Answer countdown timer
+  const [answerTimeLeft, setAnswerTimeLeft] = useState<number | null>(null);
+  const answerTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Update live analysis after each user turn (fire-and-forget, non-blocking)
+  const updateLiveAnalysis = useCallback(async (userText: string) => {
+    const data = await analyzeLive(userText);
+    setLiveAnalysis(data);
+  }, []);
+
+  const clearAnswerTimer = useCallback(() => {
+    if (answerTimerRef.current) {
+      clearInterval(answerTimerRef.current);
+      answerTimerRef.current = null;
+    }
+    setAnswerTimeLeft(null);
+  }, []);
+
+  const startAnswerTimer = useCallback((limitSeconds: number, onExpire: () => void) => {
+    clearAnswerTimer();
+    setAnswerTimeLeft(limitSeconds);
+    let remaining = limitSeconds;
+    answerTimerRef.current = setInterval(() => {
+      remaining -= 1;
+      setAnswerTimeLeft(remaining);
+      if (remaining <= 0) {
+        clearInterval(answerTimerRef.current!);
+        answerTimerRef.current = null;
+        setAnswerTimeLeft(null);
+        onExpire();
+      }
+    }, 1000);
+  }, [clearAnswerTimer]);
 
   // Multi-question state
   const [questions, setQuestions] = useState<InterviewQuestion[]>([]);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [questionResponses, setQuestionResponses] = useState<QuestionResponse[]>([]);
   const questionStartTimeRef = useRef<number>(0);
+  const sessionStartTimeRef = useRef<number | null>(null);
 
+  // Conversation history for Gemini multi-turn
+  const conversationHistoryRef = useRef<Array<{ role: 'user' | 'model'; text: string }>>([]);
+  const firstTurnRef = useRef(true);
+
+  // Media refs
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const sessionPromiseRef = useRef<Promise<any> | null>(null);
-  const sessionRef = useRef<any | null>(null);
-  const sessionOpenRef = useRef(false);
-  const nextStartTimeRef = useRef(0);
-  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const streamRef = useRef<MediaStream | null>(null);
   const preAcquiredStreamRef = useRef<MediaStream | null>(null);
-  const frameIntervalRef = useRef<number | null>(null);
-  const videoTrackRecoveryAttemptedRef = useRef(false);
-  const sessionStartTimeRef = useRef<number | null>(null);
-  // Track whether AI is currently speaking to mute mic input during playback
-  const isAISpeakingRef = useRef(false);
-  const aiPlaybackEndTimerRef = useRef<number | null>(null);
-  // Heartbeat: periodic no-op send to keep the Gemini session alive
-  const heartbeatIntervalRef = useRef<number | null>(null);
-  // Audio queue: buffer PCM chunks and flush every 150ms to smooth network jitter
-  const audioQueueRef = useRef<string[]>([]);
-  const audioFlushIntervalRef = useRef<number | null>(null);
-  const audioHealthIntervalRef = useRef<number | null>(null);
-  const lastAudioCaptureAtRef = useRef<number>(0);
-  const lastAudioSendAtRef = useRef<number>(0);
-  const lastInputTranscriptAtRef = useRef<number>(0);
-  const micRecoveryAttemptedRef = useRef(false);
-  // Session ID for Firestore transcript persistence (one per question)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const isRecordingRef = useRef(false);
+
+  // Audio playback
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const currentAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+
+  // Session ID for Firestore
   const sessionIdRef = useRef<string>('');
-  // Prevent reconnect attempts after intentional close
   const interviewFinishedRef = useRef(false);
-  const reconnectTimerRef = useRef<number | null>(null);
-  const reconnectAttemptRef = useRef(0);
-  const startLiveSessionRef = useRef<(isReconnect?: boolean) => void>(() => {});
+  const isPausedRef = useRef(false);
 
-  const buildEventContext = useCallback(() => ({
-    sessionId: sessionIdRef.current,
-    questionIndex: currentQuestionIndex,
-    elapsedMs: sessionStartTimeRef.current ? Date.now() - sessionStartTimeRef.current : undefined,
-  }), [currentQuestionIndex]);
-
-  const setConnectionStateWithEvent = useCallback((nextState: ConnectionState, reason?: string) => {
-    setConnectionState(nextState);
-    emitLiveSessionEvent('transport_state_change', {
-      ...buildEventContext(),
-      state: nextState,
-      reason,
-    });
-  }, [buildEventContext]);
-
-  const setMicHealthSafe = useCallback((nextState: MicHealthState) => {
-    if (micHealthRef.current !== nextState) {
-      micHealthRef.current = nextState;
-      setMicHealth(nextState);
-    }
-  }, []);
-
-  // Persist a single transcript message to Firestore (fire-and-forget, never throws)
-  const persistTranscriptLine = useCallback((role: 'user' | 'ai', text: string) => {
-    const user = auth.currentUser;
-    if (!user || !sessionIdRef.current) return;
-    const colRef = collection(db, 'users', user.uid, 'sessions', sessionIdRef.current, 'transcript');
-    addDoc(colRef, { role, text, timestamp: Timestamp.now() }).catch(() => {
-      emitLiveSessionEvent('transcript_persist_failure', { ...buildEventContext(), role });
-    });
-  }, [buildEventContext]);
-
-  const stopQuestionTimer = useCallback(() => {
-    if (questionTimerRef.current) {
-      clearInterval(questionTimerRef.current);
-      questionTimerRef.current = null;
-    }
-  }, []);
-
-  const cleanup = useCallback(() => {
-    if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
-    if (questionTimerRef.current) clearInterval(questionTimerRef.current);
-    if (aiPlaybackEndTimerRef.current) clearTimeout(aiPlaybackEndTimerRef.current);
-    if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
-    if (audioFlushIntervalRef.current) clearInterval(audioFlushIntervalRef.current);
-    if (audioHealthIntervalRef.current) clearInterval(audioHealthIntervalRef.current);
-    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-    if (preAcquiredStreamRef.current) preAcquiredStreamRef.current.getTracks().forEach((t) => t.stop());
-    if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
-    sourcesRef.current.forEach((s) => { try { s.stop(); } catch { /* ignore */ } });
-    sourcesRef.current.clear();
-    audioQueueRef.current = [];
-    isAISpeakingRef.current = false;
-    setMicHealthSafe('initializing');
-    setConnectionState('closed');
-  }, [setMicHealthSafe]);
+  // Transcript batch-write buffer
+  type TranscriptLine = { role: 'user' | 'ai'; text: string; timestamp: Timestamp; seq: number };
+  const transcriptBufferRef = useRef<TranscriptLine[]>([]);
+  const transcriptSeqRef = useRef(0);
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const FLUSH_BATCH_SIZE = 8;
+  const FLUSH_INTERVAL_MS = 5000;
 
   // Rotate loading messages
   useEffect(() => {
@@ -162,45 +149,342 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
     }
   }, [simState]);
 
-  const startQuestionTimer = useCallback((question: InterviewQuestion, isLastQuestion: boolean) => {
-    stopQuestionTimer();
-    autoAdvanceCalledRef.current = false;
-    setShowQuestionTimeWarning(false);
+  // Flush buffered transcript lines to Firestore using a batch write
+  const flushTranscriptBuffer = useCallback(() => {
+    const user = auth.currentUser;
+    if (!user || !sessionIdRef.current) return;
+    const lines = transcriptBufferRef.current.splice(0); // drain buffer atomically
+    if (lines.length === 0) return;
 
-    const limit = questionTimeLimitCap != null
-      ? Math.min(question.timeLimit, questionTimeLimitCap)
-      : question.timeLimit;
+    const colRef = collection(db, 'users', user.uid, 'sessions', sessionIdRef.current, 'transcript');
+    const batch = writeBatch(db);
+    lines.forEach((line) => {
+      batch.set(doc(colRef), { role: line.role, text: line.text, timestamp: line.timestamp, seq: line.seq });
+    });
+    batch.commit().catch(() => {});
+  }, []);
 
-    setQuestionTimeRemaining(limit);
+  // Buffer a transcript line; flush when batch size is reached
+  const persistTranscriptLine = useCallback((role: 'user' | 'ai', text: string) => {
+    const user = auth.currentUser;
+    if (!user || !sessionIdRef.current) return;
 
-    questionTimerRef.current = window.setInterval(() => {
-      setQuestionTimeRemaining((prev: number | null) => {
-        if (prev == null) return prev;
-        if (isPausedRef.current) return prev;
-        const next = prev - 1;
-        if (next <= 30) setShowQuestionTimeWarning(true);
-        if (next <= 0 && !autoAdvanceCalledRef.current) {
-          autoAdvanceCalledRef.current = true;
-          clearInterval(questionTimerRef.current!);
-          questionTimerRef.current = null;
-          if (isLastQuestion) {
-            setTimeout(() => handleFinish(), 0);
-          } else {
-            setTimeout(() => handleNextQuestion(), 0);
-          }
+    transcriptBufferRef.current.push({
+      role,
+      text,
+      timestamp: Timestamp.now(),
+      seq: transcriptSeqRef.current++,
+    });
+
+    // Flush immediately if batch size reached; otherwise (re)start the timer
+    if (transcriptBufferRef.current.length >= FLUSH_BATCH_SIZE) {
+      if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
+      flushTranscriptBuffer();
+    } else {
+      if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = setTimeout(flushTranscriptBuffer, FLUSH_INTERVAL_MS);
+    }
+  }, [flushTranscriptBuffer]);
+
+  // Stop any currently playing AI audio
+  const stopAIAudio = useCallback(() => {
+    if (currentAudioSourceRef.current) {
+      try { currentAudioSourceRef.current.stop(); } catch { /* already stopped */ }
+      currentAudioSourceRef.current = null;
+    }
+    setIsAISpeaking(false);
+  }, []);
+
+  // Play audio buffer returned from OpenAI TTS
+  const playAudioBuffer = useCallback(async (arrayBuffer: ArrayBuffer): Promise<void> => {
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+      audioCtxRef.current = new AudioContext();
+    }
+    const ctx = audioCtxRef.current;
+    if (ctx.state === 'suspended') await ctx.resume();
+
+    const decoded = await ctx.decodeAudioData(arrayBuffer);
+    const src = ctx.createBufferSource();
+    src.buffer = decoded;
+    src.connect(ctx.destination);
+    currentAudioSourceRef.current = src;
+    setIsAISpeaking(true);
+
+    return new Promise((resolve) => {
+      src.onended = () => {
+        currentAudioSourceRef.current = null;
+        setIsAISpeaking(false);
+        resolve();
+      };
+      src.start(0);
+    });
+  }, []);
+
+  // Fetch a single TTS chunk for a piece of text (via Cloud Function)
+  const fetchTTSBuffer = useCallback(async (text: string): Promise<ArrayBuffer | null> => {
+    return apiFetchTTSBuffer(text);
+  }, []);
+
+  // Split text into sentences, fetch TTS in parallel, play sequentially for near-instant start
+  const speakText = useCallback(async (text: string): Promise<void> => {
+    // Split on sentence boundaries, keeping punctuation
+    const sentences = text
+      .split(/(?<=[.!?])\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    if (sentences.length === 0) return;
+
+    // Kick off all fetches immediately in parallel
+    const fetchPromises = sentences.map((s) => fetchTTSBuffer(s));
+
+    // Play first sentence as soon as it arrives, then play the rest in order
+    for (let i = 0; i < fetchPromises.length; i++) {
+      const buffer = await fetchPromises[i];
+      if (!buffer) continue;
+      await playAudioBuffer(buffer);
+    }
+  }, [fetchTTSBuffer, playAudioBuffer]);
+
+  // Stream Gemini response via Cloud Function, fire TTS per sentence as they complete
+  const getAIResponseAndSpeak = useCallback(async (
+    userText: string,
+    onTextReady: (text: string) => void
+  ): Promise<string> => {
+    conversationHistoryRef.current.push({ role: 'user', text: userText });
+
+    const systemPrompt = activeQuestion
+      ? buildSystemPrompt(config, activeQuestion, currentQuestionIndex, questions.length)
+      : undefined;
+
+    let buffer = '';
+    const sentenceEnd = /[.!?]/;
+    const ttsQueue: Promise<ArrayBuffer | null>[] = [];
+
+    setMicState('speaking');
+
+    const fullText = await streamInterviewResponse(
+      conversationHistoryRef.current,
+      systemPrompt,
+      (piece) => {
+        buffer += piece;
+        // When we have a complete sentence, kick off TTS fetch immediately
+        const lastEnd = Math.max(
+          buffer.lastIndexOf('.'),
+          buffer.lastIndexOf('!'),
+          buffer.lastIndexOf('?')
+        );
+        if (lastEnd !== -1 && sentenceEnd.test(buffer[lastEnd])) {
+          const sentence = buffer.slice(0, lastEnd + 1).trim();
+          buffer = buffer.slice(lastEnd + 1);
+          if (sentence) ttsQueue.push(fetchTTSBuffer(sentence));
         }
-        return next;
-      });
-    }, 1000);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [questionTimeLimitCap, stopQuestionTimer]);
+      }
+    );
 
+    // Flush any remaining text
+    if (buffer.trim()) ttsQueue.push(fetchTTSBuffer(buffer.trim()));
+
+    conversationHistoryRef.current.push({ role: 'model', text: fullText });
+
+    // Update transcript text immediately — before audio plays
+    onTextReady(fullText);
+
+    // Play all TTS chunks in order (each was already fetching in parallel)
+    for (const fetchPromise of ttsQueue) {
+      const buf = await fetchPromise;
+      if (buf) await playAudioBuffer(buf);
+    }
+
+    return fullText;
+  }, [config, activeQuestion, currentQuestionIndex, questions.length, fetchTTSBuffer, playAudioBuffer]);
+
+  // Transcribe audio blob via Whisper Cloud Function
+  const transcribeAudio = useCallback(async (audioBlob: Blob): Promise<string> => {
+    return apiTranscribeAudio(audioBlob);
+  }, []);
+
+  // Stop recording, transcribe, get AI response, speak it
+  const stopRecordingAndProcess = useCallback(async () => {
+    if (!isRecordingRef.current || !mediaRecorderRef.current) {
+      console.warn('stopRecordingAndProcess: no active recording');
+      return;
+    }
+
+    clearAnswerTimer();
+
+    const mr = mediaRecorderRef.current;
+    // Capture mimeType NOW before stopping
+    const recorderMime = mr.mimeType || 'audio/webm';
+
+    // Check budget before processing
+    if (turnsUsedRef.current >= MAX_TURNS_PER_QUESTION) {
+      setMicState('idle');
+      return;
+    }
+
+    setMicState('processing');
+    isRecordingRef.current = false;
+
+    // Stop and wait for the final ondataavailable + onstop
+    await new Promise<void>((resolve) => {
+      mr.onstop = () => resolve();
+      if (mr.state !== 'inactive') mr.stop();
+      else resolve();
+    });
+
+    const chunks = [...audioChunksRef.current];
+    audioChunksRef.current = [];
+
+    console.log(`Recorded ${chunks.length} chunks, mime: ${recorderMime}, total bytes: ${chunks.reduce((s, c) => s + c.size, 0)}`);
+
+    if (chunks.length === 0) {
+      console.warn('No audio chunks recorded');
+      setMicState('idle');
+      return;
+    }
+
+    const audioBlob = new Blob(chunks, { type: recorderMime });
+
+    if (audioBlob.size < 500) {
+      console.warn('Audio blob too small, likely silence:', audioBlob.size);
+      setMicState('idle');
+      return;
+    }
+
+    try {
+      // 1. Whisper STT
+      const userText = await transcribeAudio(audioBlob);
+      console.log('Whisper result:', userText);
+      if (!userText) {
+        setMicState('idle');
+        return;
+      }
+
+      turnsUsedRef.current += 1;
+      setTurnsUsed(turnsUsedRef.current);
+      setTranscription((p) => [...p, `User: ${userText}`]);
+      persistTranscriptLine('user', userText);
+
+      // Fire live analysis update in background (non-blocking)
+      updateLiveAnalysis(userText);
+
+      // 2. Gemini streams response + TTS fires per sentence as they arrive
+      // onTextReady fires as soon as full text is known (before audio finishes)
+      const aiText = await getAIResponseAndSpeak(userText, (text) => {
+        setTranscription((p) => [...p, `AI: ${text}`]);
+        persistTranscriptLine('ai', text);
+      });
+      if (!aiText) {
+        setMicState('idle');
+        return;
+      }
+      setMicState('idle');
+    } catch (e) {
+      console.error('Pipeline error:', e);
+      setMicState('error');
+      setTimeout(() => setMicState('idle'), 2000);
+    }
+  }, [transcribeAudio, getAIResponseAndSpeak, persistTranscriptLine, updateLiveAnalysis]);
+
+  // Start mic recording
+  const startRecording = useCallback(() => {
+    if (!streamRef.current || isRecordingRef.current || isPausedRef.current) {
+      console.warn('startRecording blocked:', {
+        hasStream: !!streamRef.current,
+        isRecording: isRecordingRef.current,
+        isPaused: isPausedRef.current
+      });
+      return;
+    }
+    if (isAISpeaking) stopAIAudio();
+
+    // Use audio-only stream for MediaRecorder to avoid MIME type issues
+    const audioTracks = streamRef.current.getAudioTracks();
+    if (audioTracks.length === 0) {
+      console.error('No audio tracks available');
+      setMicState('error');
+      setTimeout(() => setMicState('idle'), 2000);
+      return;
+    }
+    const audioStream = new MediaStream(audioTracks);
+
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : '';
+
+    try {
+      const mr = mimeType
+        ? new MediaRecorder(audioStream, { mimeType })
+        : new MediaRecorder(audioStream);
+      audioChunksRef.current = [];
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      mr.onerror = (e) => {
+        console.error('MediaRecorder error:', e);
+        setMicState('error');
+        setTimeout(() => setMicState('idle'), 2000);
+      };
+      mediaRecorderRef.current = mr;
+      mr.start(250);
+      isRecordingRef.current = true;
+      setMicState('recording');
+      // Start countdown — auto-stop when time runs out
+      if (questionTimeLimitCap && questionTimeLimitCap > 0) {
+        startAnswerTimer(questionTimeLimitCap, () => {
+          if (isRecordingRef.current) stopRecordingAndProcess();
+        });
+      }
+    } catch (e) {
+      console.error('Failed to start MediaRecorder:', e);
+      setMicState('error');
+      setTimeout(() => setMicState('idle'), 2000);
+    }
+  }, [isAISpeaking, stopAIAudio, questionTimeLimitCap, startAnswerTimer, stopRecordingAndProcess]);
+
+  const stopQuestionTimer = useCallback(() => {
+    if (questionTimerRef.current) {
+      clearInterval(questionTimerRef.current);
+      questionTimerRef.current = null;
+    }
+  }, []);
+
+  const cleanup = useCallback(() => {
+    stopQuestionTimer();
+    stopAIAudio();
+    if (mediaRecorderRef.current && isRecordingRef.current) {
+      try { mediaRecorderRef.current.stop(); } catch { /* ignore */ }
+    }
+    isRecordingRef.current = false;
+    if (preAcquiredStreamRef.current) {
+      preAcquiredStreamRef.current.getTracks().forEach((t) => t.stop());
+      preAcquiredStreamRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+      audioCtxRef.current.close().catch(() => {});
+    }
+    // Final flush — write any remaining buffered transcript lines
+    if (flushTimerRef.current) { clearTimeout(flushTimerRef.current); flushTimerRef.current = null; }
+    flushTranscriptBuffer();
+    clearAnswerTimer();
+    setMicState('idle');
+  }, [stopQuestionTimer, stopAIAudio, flushTranscriptBuffer, clearAnswerTimer]);
+
+  useEffect(() => cleanup, [cleanup]);
+
+
+  // Generate questions + acquire media in parallel
   useEffect(() => {
     const init = async () => {
       try {
         const count = config.questionCount || 1;
-
-        // Acquire media stream with echo cancellation in parallel with question generation
         const streamPromise = navigator.mediaDevices?.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
           video: true
@@ -217,390 +501,18 @@ export const InterviewSimulation: React.FC<InterviewSimulationProps> = ({ config
         ]);
 
         if (preStream) preAcquiredStreamRef.current = preStream;
-
         setQuestions(generatedQuestions);
         setActiveQuestion(generatedQuestions[0]);
         setCurrentQuestionIndex(0);
         setSimState('preparation');
-      } catch (e) {
+      } catch {
         onError('Failed to generate questions. Please check your connection.');
       }
     };
     init();
   }, [config, onError]);
 
-  const scheduleReconnect = useCallback((reason: string) => {
-    if (interviewFinishedRef.current) return;
-    const maxAttempts = 5;
-    if (reconnectAttemptRef.current >= maxAttempts) {
-      setConnectionStateWithEvent('closed', 'reconnect_exhausted');
-      onError('Connection was lost and could not be restored. Please restart the interview session.');
-      return;
-    }
-    reconnectAttemptRef.current += 1;
-    const jitter = Math.floor(Math.random() * 300);
-    const delay = Math.min(1000 * (2 ** (reconnectAttemptRef.current - 1)) + jitter, 10000);
-    setConnectionStateWithEvent('reconnecting', reason);
-    emitLiveSessionEvent('reconnect_attempt', {
-      ...buildEventContext(),
-      reason,
-      attempt: reconnectAttemptRef.current,
-      delayMs: delay,
-    });
-    reconnectTimerRef.current = window.setTimeout(() => {
-      if (!interviewFinishedRef.current) startLiveSessionRef.current(true);
-    }, delay);
-  }, [buildEventContext, onError, setConnectionStateWithEvent]);
-
-  const startLiveSession = async (isReconnect = false) => {
-    setSimState('active');
-    setIsConnecting(true);
-    setConnectionStateWithEvent(isReconnect ? 'reconnecting' : 'connecting', isReconnect ? 'retry' : 'initial_connect');
-    sessionStartTimeRef.current = sessionStartTimeRef.current || Date.now();
-    if (!isReconnect) {
-      questionStartTimeRef.current = Date.now();
-    }
-    const isLast = currentQuestionIndex >= questions.length - 1;
-    if (!isReconnect && activeQuestion) startQuestionTimer(activeQuestion, isLast);
-    try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        onError('Camera/Microphone not available. Make sure you are using HTTPS or localhost.');
-        return;
-      }
-
-      const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
-      if (!apiKey) {
-        onError('Gemini API key is missing. Add GEMINI_API_KEY to your .env.local file.');
-        return;
-      }
-
-      const ai = new GoogleGenAI({ apiKey });
-
-      // Reuse pre-acquired stream or acquire with echo cancellation
-      let stream: MediaStream;
-      if (
-        streamRef.current
-        && streamRef.current.getAudioTracks().some((track) => track.readyState === 'live' && track.enabled)
-      ) {
-        stream = streamRef.current;
-      } else if (
-        preAcquiredStreamRef.current
-        && preAcquiredStreamRef.current.getAudioTracks().some((track) => track.readyState === 'live' && track.enabled)
-      ) {
-        stream = preAcquiredStreamRef.current;
-        preAcquiredStreamRef.current = null;
-      } else {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-            video: true
-          });
-        } catch {
-          try {
-            stream = await navigator.mediaDevices.getUserMedia({
-              audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-              video: false
-            });
-          } catch {
-            onError('Microphone access denied. Check browser permissions.');
-            return;
-          }
-        }
-      }
-
-      streamRef.current = stream;
-      const hasVideo = stream.getVideoTracks().length > 0;
-      if (videoRef.current && hasVideo) {
-        videoRef.current.srcObject = stream;
-        // Improve camera reliability across browsers/devices by explicitly playing.
-        videoRef.current.play().catch(() => { /* autoplay policies may block, user interaction usually follows */ });
-      }
-
-      const [videoTrack] = stream.getVideoTracks();
-      if (videoTrack) {
-        videoTrackRecoveryAttemptedRef.current = false;
-        const recoverVideoTrack = async () => {
-          if (videoTrackRecoveryAttemptedRef.current || interviewFinishedRef.current) return;
-          videoTrackRecoveryAttemptedRef.current = true;
-          emitLiveSessionEvent('camera_recovery_attempt', buildEventContext());
-          try {
-            const refreshed = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-            const [freshTrack] = refreshed.getVideoTracks();
-            if (!freshTrack || !streamRef.current) return;
-            streamRef.current.removeTrack(videoTrack);
-            streamRef.current.addTrack(freshTrack);
-            if (videoRef.current) {
-              videoRef.current.srcObject = streamRef.current;
-              videoRef.current.play().catch(() => { /* best effort */ });
-            }
-            emitLiveSessionEvent('camera_recovery_success', buildEventContext());
-          } catch {
-            emitLiveSessionEvent('camera_recovery_failure', buildEventContext());
-            onError('Camera feed was interrupted. Please verify camera permissions and device availability.');
-          }
-        };
-        videoTrack.onended = recoverVideoTrack;
-        videoTrack.onmute = recoverVideoTrack;
-      }
-
-      const inputAudioCtx = new AudioContext({ sampleRate: 16000 });
-      const outputAudioCtx = new AudioContext({ sampleRate: 24000 });
-      if (inputAudioCtx.state === 'suspended') {
-        await inputAudioCtx.resume().catch(() => {
-          emitLiveSessionEvent('audio_context_resume_failure', buildEventContext());
-        });
-      }
-
-      sessionOpenRef.current = false;
-      sessionRef.current = null;
-      isAISpeakingRef.current = false;
-      interviewFinishedRef.current = false;
-      lastAudioCaptureAtRef.current = Date.now();
-      lastAudioSendAtRef.current = Date.now();
-      lastInputTranscriptAtRef.current = Date.now();
-      micRecoveryAttemptedRef.current = false;
-      setMicHealthSafe('initializing');
-      if (!isReconnect || !sessionIdRef.current) {
-        // New session ID for Firestore transcript bucket
-        sessionIdRef.current = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      }
-
-      const sessionPromise = ai.live.connect({
-        model: geminiModel,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: `You are a professional interview coach conducting a mock interview session.
-
-CURRENT QUESTION: "${activeQuestion?.question}"
-
-CONVERSATION RULES:
-1. Start by clearly asking the candidate the question above.
-2. LISTEN FULLY — do NOT interrupt or speak while the candidate is answering. Wait for a clear, complete pause before responding.
-3. After the candidate finishes their answer, ALWAYS respond in exactly this two-part structure:
-   a. REFLECTION — one sentence acknowledging what they said. Be specific to their answer, not generic. Examples: "That's a strong example of handling ambiguity under pressure." / "I like how you tied the outcome back to business impact."
-   b. FOLLOW-UP — either one targeted follow-up question about their answer, OR a brief closing remark if the answer was complete and no follow-up is needed.
-4. Keep the entire response under 3 sentences. Do not over-explain or give coaching feedback mid-session.
-5. Do NOT ask multiple questions at once. One follow-up maximum.
-6. Do NOT repeat the original question unless the candidate explicitly asks.
-7. Occasionally call the 'updateAnalytics' tool to provide feedback scores, but do this silently without narrating it.
-
-EXAMPLE RESPONSE AFTER AN ANSWER:
-"That's a great example of taking ownership in a difficult situation. What was the biggest obstacle you had to overcome during that project?"
-
-TONE: Professional, encouraging, concise. You are a human interviewer — warm but focused.`,
-          realtimeInputConfig: {
-            automaticActivityDetection: {
-              disabled: false,
-              startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
-              endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
-              prefixPaddingMs: 40,
-              silenceDurationMs: 3500,
-            },
-            // Prevent AI from cutting in while user is speaking
-            activityHandling: ActivityHandling.NO_INTERRUPTION,
-          },
-          tools: [{ functionDeclarations: [ANALYTICS_FUNCTION_DECLARATION] }],
-          outputAudioTranscription: {},
-          inputAudioTranscription: {},
-        },
-        callbacks: {
-          onopen: () => {
-            sessionOpenRef.current = true;
-            reconnectAttemptRef.current = 0;
-            sessionPromise.then((s) => { sessionRef.current = s; });
-            setIsConnecting(false);
-            setConnectionStateWithEvent('open', isReconnect ? 'reconnected' : 'opened');
-
-            // --- Audio queue: buffer PCM chunks, flush every 150ms ---
-            const source = inputAudioCtx.createMediaStreamSource(stream);
-            const scriptProcessor = inputAudioCtx.createScriptProcessor(4096, 1, 1);
-            scriptProcessor.onaudioprocess = (e) => {
-              if (isPausedRef.current || isAISpeakingRef.current || !sessionOpenRef.current) return;
-              const inputData = e.inputBuffer.getChannelData(0);
-              const int16 = new Int16Array(inputData.length);
-              for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
-              audioQueueRef.current.push(encode(new Uint8Array(int16.buffer)));
-              lastAudioCaptureAtRef.current = Date.now();
-              if (micHealthRef.current !== 'recovering') {
-                setMicHealthSafe('ready');
-              }
-            };
-            source.connect(scriptProcessor);
-            scriptProcessor.connect(inputAudioCtx.destination);
-
-            // Flush audio queue every 150ms — sends chunks in order, absorbs jitter
-            audioFlushIntervalRef.current = window.setInterval(() => {
-              if (!sessionOpenRef.current || !sessionRef.current || audioQueueRef.current.length === 0) return;
-              while (audioQueueRef.current.length > 0) {
-                const chunk = audioQueueRef.current.shift()!;
-                try {
-                  sessionRef.current.sendRealtimeInput({ media: { data: chunk, mimeType: 'audio/pcm;rate=16000' } });
-                  lastAudioSendAtRef.current = Date.now();
-                } catch {
-                  emitLiveSessionEvent('realtime_send_failure', buildEventContext());
-                  audioQueueRef.current = [];
-                  setConnectionStateWithEvent('degraded', 'audio_send_failed');
-                  break;
-                }
-              }
-            }, 150);
-
-            audioHealthIntervalRef.current = window.setInterval(() => {
-              if (!sessionOpenRef.current || !sessionRef.current || isPausedRef.current) return;
-              const now = Date.now();
-              const captureGapMs = now - lastAudioCaptureAtRef.current;
-              const sendGapMs = now - lastAudioSendAtRef.current;
-              const transcriptGapMs = now - lastInputTranscriptAtRef.current;
-
-              if (captureGapMs > 6000 || sendGapMs > 6000) {
-                setMicHealthSafe('recovering');
-                if (!micRecoveryAttemptedRef.current) {
-                  micRecoveryAttemptedRef.current = true;
-                  emitLiveSessionEvent('mic_stall_detected', {
-                    ...buildEventContext(),
-                    captureGapMs,
-                    sendGapMs,
-                    transcriptGapMs,
-                  });
-                  scheduleReconnect('mic_stall');
-                }
-                return;
-              }
-
-              if (transcriptGapMs > 9000) {
-                setMicHealthSafe('waiting_for_speech');
-              } else {
-                setMicHealthSafe('ready');
-              }
-            }, 2000);
-
-            // --- Heartbeat: send a silent audio frame every 20s to keep session alive ---
-            heartbeatIntervalRef.current = window.setInterval(() => {
-              if (!sessionOpenRef.current || !sessionRef.current) return;
-              // 1 frame of silence (256 zero samples) encoded as base64 PCM
-              const silence = encode(new Uint8Array(512)); // 256 int16 = 512 bytes of zeros
-              try {
-                sessionRef.current.sendRealtimeInput({ media: { data: silence, mimeType: 'audio/pcm;rate=16000' } });
-              } catch {
-                emitLiveSessionEvent('heartbeat_failure', buildEventContext());
-                setConnectionStateWithEvent('degraded', 'heartbeat_failed');
-              }
-            }, 20000);
-
-            if (!hasVideo) return;
-            frameIntervalRef.current = window.setInterval(() => {
-              if (isPausedRef.current || !sessionOpenRef.current || !sessionRef.current) return;
-              if (videoRef.current && canvasRef.current) {
-                const ctx = canvasRef.current.getContext('2d');
-                ctx?.drawImage(videoRef.current, 0, 0, 320, 240);
-                canvasRef.current.toBlob(
-                  async (blob) => {
-                    if (blob && sessionOpenRef.current && sessionRef.current) {
-                      const data = await blobToBase64(blob);
-                      try {
-                        sessionRef.current.sendRealtimeInput({ media: { data, mimeType: 'image/jpeg' } });
-                      } catch {
-                        emitLiveSessionEvent('realtime_send_failure', { ...buildEventContext(), mediaType: 'image/jpeg' });
-                      }
-                    }
-                  },
-                  'image/jpeg',
-                  0.6
-                );
-              }
-            }, 1000);
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            // Handle transcriptions — persist each line to Firestore as it arrives
-            const outText = message.serverContent?.outputTranscription?.text;
-            const inText = message.serverContent?.inputTranscription?.text;
-            if (outText) {
-              setTranscription((p: string[]) => [...p, `AI: ${outText}`]);
-              persistTranscriptLine('ai', outText);
-            }
-            if (inText) {
-              setTranscription((p: string[]) => [...p, `User: ${inText}`]);
-              persistTranscriptLine('user', inText);
-              lastInputTranscriptAtRef.current = Date.now();
-              setMicHealthSafe('ready');
-            }
-
-            // Process audio parts — mark AI as speaking while audio plays
-            const parts = message.serverContent?.modelTurn?.parts || [];
-            for (const part of parts) {
-              if (part.inlineData?.data) {
-                const audio = part.inlineData.data;
-                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputAudioCtx.currentTime);
-                const buf = await decodeAudioData(decode(audio), outputAudioCtx, 24000, 1);
-                const src = outputAudioCtx.createBufferSource();
-                src.buffer = buf;
-                src.connect(outputAudioCtx.destination);
-                src.start(nextStartTimeRef.current);
-                isAISpeakingRef.current = true;
-                if (aiPlaybackEndTimerRef.current) clearTimeout(aiPlaybackEndTimerRef.current);
-                const playbackDuration = (nextStartTimeRef.current + buf.duration - outputAudioCtx.currentTime) * 1000;
-                aiPlaybackEndTimerRef.current = window.setTimeout(() => {
-                  isAISpeakingRef.current = false;
-                }, playbackDuration + 300);
-                nextStartTimeRef.current += buf.duration;
-                sourcesRef.current.add(src);
-              }
-            }
-
-            if (message.toolCall) {
-              for (const fc of message.toolCall.functionCalls) {
-                if (fc.name === 'updateAnalytics') {
-                  setLiveAnalysis(fc.args as any);
-                  if (sessionOpenRef.current && sessionRef.current) {
-                    try {
-                      sessionRef.current.sendToolResponse({
-                        functionResponses: { id: fc.id, name: fc.name, response: { status: 'ok' } }
-                      });
-                    } catch { /* session closed */ }
-                  }
-                }
-              }
-            }
-          },
-          onerror: (e: any) => {
-            setMicHealthSafe('error');
-            setConnectionStateWithEvent('degraded', 'socket_error');
-            console.error('Gemini Live error:', e);
-          },
-          onclose: (e: any) => {
-            sessionOpenRef.current = false;
-            sessionRef.current = null;
-            isAISpeakingRef.current = false;
-            audioQueueRef.current = [];
-            if (heartbeatIntervalRef.current) { clearInterval(heartbeatIntervalRef.current); heartbeatIntervalRef.current = null; }
-            if (audioFlushIntervalRef.current) { clearInterval(audioFlushIntervalRef.current); audioFlushIntervalRef.current = null; }
-            if (audioHealthIntervalRef.current) { clearInterval(audioHealthIntervalRef.current); audioHealthIntervalRef.current = null; }
-            setMicHealthSafe('initializing');
-            setConnectionStateWithEvent('closed', e?.reason || 'socket_closed');
-            console.warn('Gemini Live closed — code:', e?.code, 'reason:', e?.reason);
-            // Reconnect only if the interview is still in progress and close was unexpected
-            if (!interviewFinishedRef.current && e?.code !== 1000) {
-              scheduleReconnect(e?.reason || `code_${e?.code || 'unknown'}`);
-            }
-          }
-        }
-      });
-      sessionPromiseRef.current = sessionPromise;
-    } catch (err) {
-      setMicHealthSafe('error');
-      setConnectionStateWithEvent('degraded', 'connect_failed');
-      console.error('Live session error:', err);
-      const message = err instanceof Error ? err.message : String(err);
-      onError(`Failed to start AI session: ${message}`);
-    }
-  };
-
-  startLiveSessionRef.current = startLiveSession;
-
-  useEffect(() => cleanup, [cleanup]);
-
-  // Auto-save session state every 10 seconds
+  // Auto-save session state every 10s
   useEffect(() => {
     if (simState !== 'active' && simState !== 'preparation') return;
     const interval = setInterval(() => {
@@ -617,9 +529,72 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
     return () => clearInterval(interval);
   }, [simState, config, questions, currentQuestionIndex, questionResponses, transcription]);
 
-  const clearRecoveryOnFinish = useCallback(() => {
-    sessionRecovery.clear();
-  }, []);
+  const startActiveSession = useCallback(async () => {
+    setSimState('active');
+    sessionStartTimeRef.current = sessionStartTimeRef.current || Date.now();
+    questionStartTimeRef.current = Date.now();
+    sessionIdRef.current = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    conversationHistoryRef.current = [];
+    firstTurnRef.current = true;
+    interviewFinishedRef.current = false;
+    turnsUsedRef.current = 0;
+    setTurnsUsed(0);
+
+    // Acquire or reuse media stream
+    let stream: MediaStream;
+    if (streamRef.current?.getAudioTracks().some((t) => t.readyState === 'live')) {
+      stream = streamRef.current;
+    } else if (preAcquiredStreamRef.current?.getAudioTracks().some((t) => t.readyState === 'live')) {
+      stream = preAcquiredStreamRef.current;
+      preAcquiredStreamRef.current = null;
+    } else {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: true
+        });
+      } catch {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+            video: false
+          });
+        } catch {
+          onError('Microphone access denied. Check browser permissions.');
+          return;
+        }
+      }
+    }
+
+    streamRef.current = stream;
+
+    // Attach camera — use requestAnimationFrame to ensure the video element is mounted
+    if (stream.getVideoTracks().length > 0) {
+      requestAnimationFrame(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => {});
+        }
+      });
+    }
+
+    audioCtxRef.current = new AudioContext();
+
+    // AI speaks the question first — timer starts only after AI finishes
+    if (activeQuestion) {
+      const openingText = activeQuestion.question;
+      conversationHistoryRef.current.push({ role: 'model', text: openingText });
+      setTranscription((p) => [...p, `AI: ${openingText}`]);
+      persistTranscriptLine('ai', openingText);
+      setMicState('speaking');
+      try {
+        await speakText(openingText);
+      } catch (e) {
+        console.error('TTS opening failed:', e);
+      }
+      setMicState('idle');
+    }
+  }, [activeQuestion, currentQuestionIndex, questions.length, speakText, persistTranscriptLine, onError]);
 
   const togglePause = useCallback(() => {
     setIsPaused((prev) => {
@@ -628,9 +603,12 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
       if (streamRef.current) {
         streamRef.current.getAudioTracks().forEach((t) => (t.enabled = !next));
       }
+      if (next && isRecordingRef.current) {
+        stopRecordingAndProcess();
+      }
       return next;
     });
-  }, []);
+  }, [stopRecordingAndProcess]);
 
   const saveCurrentQuestionResponse = () => {
     if (activeQuestion) {
@@ -648,36 +626,46 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
 
   const handleNextQuestion = async () => {
     const currentResponse = saveCurrentQuestionResponse();
-
     stopQuestionTimer();
-    setQuestionTimeRemaining(null);
-    setShowQuestionTimeWarning(false);
-    autoAdvanceCalledRef.current = false;
+    interviewFinishedRef.current = true;
 
-    interviewFinishedRef.current = true; // prevent reconnect on intentional close
-    sessionOpenRef.current = false;
-    if (sessionRef.current) { try { sessionRef.current.close(); } catch { /* ignore */ } sessionRef.current = null; }
-    sessionPromiseRef.current = null;
-    cleanup();
+    if (isRecordingRef.current) {
+      try { mediaRecorderRef.current?.stop(); } catch { /* ignore */ }
+      isRecordingRef.current = false;
+    }
+    stopAIAudio();
 
     const nextIndex = currentQuestionIndex + 1;
     if (nextIndex < questions.length) {
+      // Reset per-question state for the next question
+      conversationHistoryRef.current = [];
+      firstTurnRef.current = true;
+      turnsUsedRef.current = 0;
+      setTurnsUsed(0);
       setCurrentQuestionIndex(nextIndex);
       setActiveQuestion(questions[nextIndex]);
       setTranscription([]);
+      interviewFinishedRef.current = false;
       setSimState('preparation');
     }
   };
 
   const handleFinish = async () => {
-    interviewFinishedRef.current = true; // prevent reconnect on intentional close
+    interviewFinishedRef.current = true;
     stopQuestionTimer();
+
+    if (isRecordingRef.current) {
+      try { mediaRecorderRef.current?.stop(); } catch { /* ignore */ }
+      isRecordingRef.current = false;
+    }
+    stopAIAudio();
+
     const currentResponse = saveCurrentQuestionResponse();
     const allResponses = currentResponse ? [...questionResponses, currentResponse] : questionResponses;
 
     setSimState('analyzing');
-    setIsConnecting(true);
-    clearRecoveryOnFinish();
+    sessionRecovery.clear();
+
     const sessionDuration = sessionStartTimeRef.current
       ? Math.round((Date.now() - sessionStartTimeRef.current) / 1000)
       : 0;
@@ -686,48 +674,56 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
       .map((r, i) => `--- Question ${i + 1}: ${r.question.question} ---\n${r.transcription}`)
       .join('\n\n');
 
+    const sessionId = Math.random().toString(36).substr(2, 9);
+    const user = auth.currentUser;
+
+    // Call analyzeInterview Cloud Function directly — avoids Firestore trigger race condition
+    let evaluation = { metrics: { communication: 65, confidence: 65, technicalAccuracy: 65, bodyLanguage: 65, answerStructure: 65, clarity: 65, overall: 65 }, strengths: [] as string[], improvementAreas: [] as string[], suggestions: [] as string[] };
     try {
-      const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Analysis timed out')), 30000)
-      );
-      const summary = await Promise.race([generateInterviewSummary(config, fullTranscription), timeout]);
-      cleanup();
-      if (sessionPromiseRef.current) {
-        sessionPromiseRef.current.then((s) => { try { s.close(); } catch { /* ignore */ } });
+      evaluation = await analyzeInterview(config, fullTranscription);
+    } catch (err) {
+      console.error('Evaluation failed:', err);
+    }
+
+    const result = {
+      id: sessionId,
+      date: new Date().toISOString(),
+      config,
+      metrics: evaluation.metrics,
+      suggestions: evaluation.suggestions,
+      strengths: evaluation.strengths,
+      improvementAreas: evaluation.improvementAreas,
+      transcription: fullTranscription,
+      duration: sessionDuration,
+      questions: allResponses,
+      status: 'complete',
+    };
+
+    // Save completed result to Firestore
+    if (user) {
+      const interviewRef = collection(db, 'users', user.uid, 'interviews');
+      try {
+        const docRef = await addDoc(interviewRef, {
+          ...result,
+          createdAt: Timestamp.now(),
+        });
+        cleanup();
+        onFinish({ ...result, id: docRef.id } as any);
+      } catch (err) {
+        console.error('Failed to save interview to Firestore:', err);
+        cleanup();
+        onFinish(result as any);
       }
-      onFinish({
-        id: Math.random().toString(36).substr(2, 9),
-        date: new Date().toISOString(),
-        config,
-        metrics: summary.metrics!,
-        suggestions: summary.suggestions!,
-        strengths: summary.strengths,
-        improvementAreas: summary.improvementAreas,
-        transcription: fullTranscription,
-        duration: sessionDuration,
-        questions: allResponses
-      });
-    } catch (e) {
-      console.error('Analysis error:', e);
+    } else {
       cleanup();
-      onFinish({
-        id: Math.random().toString(36).substr(2, 9),
-        date: new Date().toISOString(),
-        config,
-        metrics: { communication: 65, confidence: 65, technicalAccuracy: 65, bodyLanguage: 65, answerStructure: 65, clarity: 65, overall: 65 },
-        suggestions: ['Summary generation failed, but your effort was noted!', 'Practice more to refine results.', 'Try again with a stable internet connection.'],
-        strengths: [],
-        improvementAreas: [],
-        transcription: fullTranscription,
-        duration: sessionDuration,
-        questions: allResponses
-      });
+      onFinish(result as any);
     }
   };
 
+  // ─── Loading / Analyzing screen ───────────────────────────────────────────
   if (simState === 'generating' || simState === 'analyzing') {
     return (
-      <div className="flex flex-col items-center justify-center h-[80vh] space-y-8" role="status" aria-live="polite">
+      <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-8 px-4" role="status" aria-live="polite">
         <div className="relative">
           <div className="w-24 h-24 border-8 border-slate-100 dark:border-slate-700 rounded-full" />
           <div className="absolute top-0 left-0 w-24 h-24 border-8 border-blue-600 border-t-transparent rounded-full animate-spin" />
@@ -744,6 +740,7 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
     );
   }
 
+  // ─── Preparation screen ────────────────────────────────────────────────────
   if (simState === 'preparation') {
     const isMultiQuestion = questions.length > 1;
     return (
@@ -793,11 +790,11 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
               ))}
             </div>
             <button
-              onClick={startLiveSession}
-              aria-label={`Start recording answer for question ${currentQuestionIndex + 1}`}
+              onClick={startActiveSession}
+              aria-label={`Start interview for question ${currentQuestionIndex + 1}`}
               className="w-full md:w-auto px-16 py-5 bg-blue-600 text-white rounded-[24px] font-black text-xl shadow-2xl shadow-blue-200 hover:scale-105 transition-all active:scale-95"
             >
-              Start Recording
+              Start Interview
             </button>
           </div>
         </div>
@@ -805,26 +802,36 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
     );
   }
 
+  // ─── Active interview screen ───────────────────────────────────────────────
   const isLastQuestion = currentQuestionIndex >= questions.length - 1;
   const hasMultipleQuestions = questions.length > 1;
-  const recordingLabel = isConnecting
-    ? 'Establishing...'
-    : isPaused
-      ? 'Paused'
-      : micHealth === 'recovering'
-        ? 'Recovering Mic...'
-        : 'Recording Active';
 
-  const micHint = micHealth === 'waiting_for_speech'
-    ? 'Mic ready, waiting for speech'
-    : micHealth === 'recovering'
-      ? 'Mic or transcription stalled, reconnecting'
-      : micHealth === 'error'
-        ? 'Mic pipeline degraded'
-        : 'Mic streaming healthy';
+  const micLabel = micState === 'recording'
+    ? 'Recording — click to send'
+    : micState === 'processing'
+      ? 'Processing...'
+      : micState === 'speaking'
+        ? 'AI Speaking...'
+        : micState === 'error'
+          ? 'Error — try again'
+          : isPaused
+            ? 'Paused'
+            : turnBudgetExhausted
+              ? 'Turn limit reached'
+              : 'Click mic to answer';
+
+  const micHint = micState === 'recording'
+    ? 'Speak your answer, then click Stop'
+    : micState === 'processing'
+      ? 'Transcribing & generating response...'
+      : micState === 'speaking'
+        ? 'AI interviewer is speaking'
+        : turnBudgetExhausted
+          ? 'Max turns used — click Finish & Analyze when ready'
+          : `Turn ${turnsUsed + 1} of ${MAX_TURNS_PER_QUESTION} — press mic to answer`;
 
   return (
-    <div className="flex flex-col lg:flex-row gap-6 p-4 md:p-6 h-[calc(100vh-80px)] overflow-hidden">
+    <div className="flex flex-col lg:flex-row gap-6 p-3 md:p-6 min-h-[calc(100vh-80px)] overflow-x-hidden">
       <div className="flex-1 flex flex-col gap-4 min-h-0">
         {hasMultipleQuestions && (
           <div className="glass p-4 rounded-2xl flex items-center justify-center gap-4 border-slate-200 shadow-sm">
@@ -847,105 +854,130 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
             </span>
           </div>
         )}
+
         <div className="relative flex-1 min-h-[300px]">
           <VideoCapture ref={videoRef} className="h-full" />
-          <canvas ref={canvasRef} className="hidden" width="320" height="240" />
           <div className="absolute bottom-4 left-4 right-4 md:bottom-6 md:left-6 md:right-6">
             <FeedbackDisplay analysis={liveAnalysis} />
           </div>
         </div>
-        {showQuestionTimeWarning && questionTimeRemaining != null && questionTimeRemaining > 0 && (
-          <div
-            className="bg-red-500 text-white px-6 py-3 rounded-2xl flex items-center gap-3 animate-pulse"
-            role="alert"
-            aria-live="assertive"
-          >
-            <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            <p className="text-sm font-black">
-              {questionTimeRemaining <= 10
-                ? `Time's up in ${questionTimeRemaining}s...`
-                : `${questionTimeRemaining}s remaining — wrap up your answer!`}
-            </p>
-          </div>
-        )}
+
+        {/* Controls bar */}
         <div
           className="glass p-5 rounded-[32px] flex items-center justify-between border-slate-200 shadow-sm"
           role="toolbar"
           aria-label="Recording controls"
         >
           <div className="flex items-center space-x-4 px-2">
-            <div className="relative" aria-hidden="true">
-              <div
-                className={`w-12 h-12 rounded-full ${isPaused ? 'bg-yellow-100' : 'bg-blue-100'} flex items-center justify-center`}
-              >
-                {!isPaused && <div className="w-4 h-4 bg-blue-600 rounded-full animate-ping opacity-75 absolute" />}
-                <div className={`w-4 h-4 ${isPaused ? 'bg-yellow-500' : 'bg-blue-600'} rounded-full relative`} />
-              </div>
-            </div>
+            {/* Mic button */}
+            <button
+              disabled={micState === 'processing' || micState === 'speaking' || isPaused || (turnBudgetExhausted && micState !== 'recording')}
+              onClick={micState === 'recording' ? stopRecordingAndProcess : startRecording}
+              aria-label={micState === 'recording' ? 'Stop recording and send' : turnBudgetExhausted ? 'Turn limit reached' : 'Start recording your answer'}
+              className={`w-14 h-14 rounded-full flex items-center justify-center transition-all shadow-lg active:scale-95 disabled:opacity-40 ${
+                micState === 'recording'
+                  ? 'bg-red-500 text-white animate-pulse shadow-red-200'
+                  : micState === 'processing'
+                    ? 'bg-yellow-400 text-white'
+                    : micState === 'speaking'
+                      ? 'bg-blue-400 text-white'
+                      : 'bg-blue-600 text-white hover:bg-blue-700 shadow-blue-200'
+              }`}
+            >
+              {micState === 'recording' ? (
+                <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+                  <rect x="6" y="6" width="12" height="12" rx="2" />
+                </svg>
+              ) : micState === 'processing' ? (
+                <svg className="w-6 h-6 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+              ) : (
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                </svg>
+              )}
+            </button>
+
             <div className="hidden sm:block">
-              <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Simulation Mode</p>
+              <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest">Interview Mode</p>
               <p className="font-black text-slate-800 dark:text-white text-lg" aria-live="polite">
-                {recordingLabel}
+                {micLabel}
               </p>
-              <p className="text-xs font-bold text-slate-500">Transport: {connectionState} · {micHint}</p>
+              <p className="text-xs font-bold text-slate-500">{micHint}</p>
             </div>
-            {questionTimeRemaining != null && (
+
+            {/* Answer countdown timer */}
+            {answerTimeLeft !== null && (
               <div
                 className={`hidden sm:flex flex-col items-center px-4 py-2 rounded-xl border ${
-                  questionTimeRemaining <= 30
-                    ? 'border-red-300 bg-red-50 dark:bg-red-950/30'
-                    : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800'
+                  answerTimeLeft <= 10
+                    ? 'border-red-400 bg-red-50 dark:bg-red-950/30'
+                    : answerTimeLeft <= 30
+                      ? 'border-yellow-400 bg-yellow-50 dark:bg-yellow-950/30'
+                      : 'border-blue-300 bg-blue-50 dark:bg-blue-950/30'
                 }`}
                 aria-live="polite"
-                aria-label={`Time remaining: ${questionTimeRemaining}s`}
               >
                 <p className="text-[9px] font-black uppercase tracking-widest text-slate-400">Time Left</p>
-                <p className={`text-base font-black tabular-nums ${questionTimeRemaining <= 30 ? 'text-red-500' : 'text-slate-800 dark:text-white'}`}>
-                  {questionTimeRemaining}s
+                <p className={`text-base font-black tabular-nums ${answerTimeLeft <= 10 ? 'text-red-500 animate-pulse' : answerTimeLeft <= 30 ? 'text-yellow-600' : 'text-blue-600'}`}>
+                  {Math.floor(answerTimeLeft / 60)}:{String(answerTimeLeft % 60).padStart(2, '0')}
                 </p>
               </div>
             )}
+
+            {/* Turns counter */}
+            <div
+              className={`hidden sm:flex flex-col items-center px-4 py-2 rounded-xl border ${
+                turnBudgetExhausted
+                  ? 'border-orange-300 bg-orange-50 dark:bg-orange-950/30'
+                  : turnsUsed >= MAX_TURNS_PER_QUESTION - 1
+                    ? 'border-yellow-300 bg-yellow-50 dark:bg-yellow-950/30'
+                    : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800'
+              }`}
+              aria-live="polite"
+            >
+              <p className="text-[9px] font-black uppercase tracking-widest text-slate-400">Turns</p>
+              <p className={`text-base font-black tabular-nums ${turnBudgetExhausted ? 'text-orange-500' : 'text-slate-800 dark:text-white'}`}>
+                {turnsUsed}/{MAX_TURNS_PER_QUESTION}
+              </p>
+            </div>
+
           </div>
+
           <div className="flex items-center gap-3">
             <button
-              disabled={isConnecting}
               onClick={togglePause}
-              aria-label={isPaused ? 'Resume recording' : 'Pause recording'}
-              className={`px-6 py-4 rounded-2xl font-black uppercase text-xs tracking-[0.2em] active:scale-95 disabled:opacity-50 transition-all ${
+              aria-label={isPaused ? 'Resume interview' : 'Pause interview'}
+              className={`px-6 py-4 rounded-2xl font-black uppercase text-xs tracking-[0.2em] active:scale-95 transition-all ${
                 isPaused
-                  ? 'bg-green-500 text-white hover:bg-green-600 shadow-xl shadow-green-100 dark:shadow-green-900/30'
-                  : 'bg-yellow-500 text-white hover:bg-yellow-600 shadow-xl shadow-yellow-100 dark:shadow-yellow-900/30'
+                  ? 'bg-green-500 text-white hover:bg-green-600 shadow-xl shadow-green-100'
+                  : 'bg-yellow-500 text-white hover:bg-yellow-600 shadow-xl shadow-yellow-100'
               }`}
             >
               {isPaused ? '▶ Resume' : '⏸ Pause'}
             </button>
             {hasMultipleQuestions && !isLastQuestion && (
               <button
-                disabled={isConnecting}
                 onClick={handleNextQuestion}
-                aria-label={`Move to question ${currentQuestionIndex + 2} of ${questions.length}`}
-                className="px-8 py-4 bg-blue-600 text-white rounded-2xl font-black hover:bg-blue-700 transition-all shadow-xl shadow-blue-100 uppercase text-xs tracking-[0.2em] active:scale-95 disabled:opacity-50"
+                aria-label={`Move to question ${currentQuestionIndex + 2}`}
+                className="px-8 py-4 bg-blue-600 text-white rounded-2xl font-black hover:bg-blue-700 transition-all shadow-xl shadow-blue-100 uppercase text-xs tracking-[0.2em] active:scale-95"
               >
                 Next Question →
               </button>
             )}
             <button
-              disabled={isConnecting}
               onClick={handleFinish}
-              aria-label={
-                isLastQuestion || !hasMultipleQuestions
-                  ? 'Finish interview and analyze results'
-                  : 'End interview early and analyze results'
-              }
-              className="px-10 py-4 bg-red-500 text-white rounded-2xl font-black hover:bg-red-600 transition-all shadow-xl shadow-red-100 uppercase text-xs tracking-[0.2em] active:scale-95 disabled:opacity-50"
+              aria-label={isLastQuestion || !hasMultipleQuestions ? 'Finish interview' : 'End interview early'}
+              className="px-10 py-4 bg-red-500 text-white rounded-2xl font-black hover:bg-red-600 transition-all shadow-xl shadow-red-100 uppercase text-xs tracking-[0.2em] active:scale-95"
             >
               {isLastQuestion || !hasMultipleQuestions ? 'Finish & Analyze' : 'End Early'}
             </button>
           </div>
         </div>
       </div>
+
+      {/* Transcript panel — desktop sidebar */}
       <aside
         className="hidden lg:flex w-96 bg-white dark:bg-slate-800 rounded-[40px] p-8 shadow-sm border border-slate-200 dark:border-slate-700 flex-col min-h-0"
         aria-label="Live transcript"
@@ -953,16 +985,11 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
         <h3 className="font-black text-slate-900 dark:text-white mb-8 uppercase text-[10px] tracking-[0.3em]">
           Session Transcript
         </h3>
-        <div
-          className="flex-1 overflow-y-auto space-y-6 pr-4 custom-scrollbar"
-          aria-live="polite"
-          aria-relevant="additions"
-        >
+        <div className="flex-1 overflow-y-auto space-y-6 pr-4 custom-scrollbar" aria-live="polite" aria-relevant="additions">
           {transcription.map((line, idx) => (
-            <div
-              key={idx}
-              className={`p-4 rounded-[20px] text-sm font-medium animate-in fade-in slide-in-from-right-2 duration-300 ${line.startsWith('AI:') ? 'bg-slate-50 dark:bg-slate-700 text-slate-600 dark:text-slate-300' : 'bg-blue-600 text-white shadow-lg shadow-blue-100 dark:shadow-blue-900/30'}`}
-            >
+            <div key={idx} className={`p-4 rounded-[20px] text-sm font-medium animate-in fade-in slide-in-from-right-2 duration-300 ${
+              line.startsWith('AI:') ? 'bg-slate-50 dark:bg-slate-700 text-slate-600 dark:text-slate-300' : 'bg-blue-600 text-white shadow-lg shadow-blue-100 dark:shadow-blue-900/30'
+            }`}>
               <div className="text-[10px] font-black uppercase opacity-60 mb-1">{line.split(': ')[0]}</div>
               {line.replace(/^(AI|User): /, '')}
             </div>
@@ -970,18 +997,58 @@ TONE: Professional, encouraging, concise. You are a human interviewer — warm b
           {transcription.length === 0 && (
             <div className="text-center py-12 text-slate-300 dark:text-slate-500">
               <svg className="w-12 h-12 mx-auto mb-4 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth="2"
-                  d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-                />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
               </svg>
-              <p className="font-bold text-xs">Waiting for speech...</p>
+              <p className="font-bold text-xs">AI will ask the question when you start...</p>
             </div>
           )}
         </div>
       </aside>
+
+      {/* Mobile transcript drawer */}
+      <div className="lg:hidden">
+        <button
+          onClick={() => setMobileTranscriptOpen((p) => !p)}
+          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-5 py-3 bg-blue-600 text-white rounded-full shadow-xl text-xs font-black uppercase tracking-widest"
+          aria-label="Toggle transcript"
+        >
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-3 3-3-3z" />
+          </svg>
+          Transcript {transcription.length > 0 && `(${transcription.length})`}
+        </button>
+
+        {mobileTranscriptOpen && (
+          <div className="fixed inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={() => setMobileTranscriptOpen(false)}>
+            <div
+              className="bg-white dark:bg-slate-800 rounded-t-3xl p-6 max-h-[60vh] flex flex-col"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-black text-slate-900 dark:text-white uppercase text-[10px] tracking-[0.3em]">Session Transcript</h3>
+                <button onClick={() => setMobileTranscriptOpen(false)} className="w-7 h-7 rounded-full bg-slate-100 dark:bg-slate-700 flex items-center justify-center">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <div className="overflow-y-auto space-y-4 flex-1" aria-live="polite">
+                {transcription.map((line, idx) => (
+                  <div key={idx} className={`p-3 rounded-2xl text-sm font-medium ${
+                    line.startsWith('AI:') ? 'bg-slate-50 dark:bg-slate-700 text-slate-600 dark:text-slate-300' : 'bg-blue-600 text-white'
+                  }`}>
+                    <div className="text-[10px] font-black uppercase opacity-60 mb-1">{line.split(': ')[0]}</div>
+                    {line.replace(/^(AI|User): /, '')}
+                  </div>
+                ))}
+                {transcription.length === 0 && (
+                  <p className="text-center text-sm text-slate-400 py-8">No transcript yet.</p>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 };

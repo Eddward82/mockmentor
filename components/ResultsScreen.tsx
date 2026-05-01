@@ -1,12 +1,16 @@
 import React, { useEffect, useState } from 'react';
 import { InterviewResult } from '../types';
+import { db } from '../services/firebase';
+import { doc, onSnapshot } from 'firebase/firestore';
 import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis, ResponsiveContainer
 } from 'recharts';
 
 interface ResultsScreenProps {
-  result: InterviewResult;
+  result: InterviewResult & { status?: string };
   onDone: () => void;
+  /** Firestore path e.g. "users/uid/interviews/sessionId" — used for async polling */
+  sessionDocPath?: string;
 }
 
 const scoreColor = (v: number) =>
@@ -33,13 +37,85 @@ const ScoreBar: React.FC<{ label: string; value: number; show: boolean; delay: n
   </div>
 );
 
-export const ResultsScreen: React.FC<ResultsScreenProps> = ({ result, onDone }) => {
+const LOADING_MESSAGES = [
+  'Evaluating your communication style...',
+  'Analysing technical keyword density...',
+  'Reviewing confidence and delivery...',
+  'Calculating performance metrics...',
+  'Summarising actionable improvement steps...',
+  'Finalising your growth roadmap...',
+];
+
+export const ResultsScreen: React.FC<ResultsScreenProps> = ({ result: initialResult, onDone, sessionDocPath }) => {
+  const [result, setResult] = useState(initialResult);
+  const [isPending, setIsPending] = useState(
+    (initialResult as any).status === 'processing'
+  );
+  const [loadingMsgIdx, setLoadingMsgIdx] = useState(0);
   const [showScores, setShowScores] = useState(false);
 
+  // Rotate loading messages while waiting
   useEffect(() => {
-    const timer = setTimeout(() => setShowScores(true), 400);
-    return () => clearTimeout(timer);
-  }, []);
+    if (!isPending) return;
+    const interval = setInterval(() => {
+      setLoadingMsgIdx((i) => (i + 1) % LOADING_MESSAGES.length);
+    }, 2500);
+    return () => clearInterval(interval);
+  }, [isPending]);
+
+  // Listen to Firestore for evaluation completion
+  useEffect(() => {
+    if (!isPending || !sessionDocPath) return;
+
+    const ref = doc(db, sessionDocPath);
+    const unsub = onSnapshot(ref, (snap) => {
+      if (!snap.exists()) return;
+      const data = snap.data() as any;
+      if (data.status === 'complete' || data.status === 'failed') {
+        setResult((prev) => ({
+          ...prev,
+          metrics: data.metrics ?? prev.metrics,
+          strengths: data.strengths ?? prev.strengths,
+          improvementAreas: data.improvementAreas ?? prev.improvementAreas,
+          suggestions: data.suggestions ?? prev.suggestions,
+          status: data.status,
+        }));
+        setIsPending(false);
+        // Small delay so the transition feels intentional
+        setTimeout(() => setShowScores(true), 400);
+        unsub();
+      }
+    });
+
+    return () => unsub();
+  }, [isPending, sessionDocPath]);
+
+  // If result was already complete on mount (e.g. navigating back), show immediately
+  useEffect(() => {
+    if (!isPending) {
+      const timer = setTimeout(() => setShowScores(true), 400);
+      return () => clearTimeout(timer);
+    }
+  }, [isPending]);
+
+  // ── Loading / pending state ────────────────────────────────────────────────
+  if (isPending) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-8 px-4" role="status" aria-live="polite">
+        <div className="relative">
+          <div className="w-24 h-24 border-8 border-slate-100 dark:border-slate-700 rounded-full" />
+          <div className="absolute top-0 left-0 w-24 h-24 border-8 border-blue-600 border-t-transparent rounded-full animate-spin" />
+        </div>
+        <div className="text-center max-w-sm px-6">
+          <h2 className="text-3xl font-black text-slate-800 dark:text-white mb-2">Analysing your performance</h2>
+          <p className="text-slate-500 font-bold min-h-[1.5em] transition-all duration-500 animate-pulse">
+            {LOADING_MESSAGES[loadingMsgIdx]}
+          </p>
+          <p className="text-xs text-slate-400 mt-4">This usually takes 10–20 seconds.</p>
+        </div>
+      </div>
+    );
+  }
 
   const m = result.metrics;
 
@@ -49,21 +125,21 @@ export const ResultsScreen: React.FC<ResultsScreenProps> = ({ result, onDone }) 
     { subject: 'Technical', A: m.technicalAccuracy },
     { subject: 'Structure', A: m.answerStructure ?? 0 },
     { subject: 'Clarity', A: m.clarity ?? 0 },
-    { subject: 'Body Lang.', A: m.bodyLanguage },
+    { subject: 'Delivery', A: m.bodyLanguage },
   ];
 
   const scoreBars = [
-    { label: 'Communication',    value: m.communication },
-    { label: 'Confidence',       value: m.confidence },
+    { label: 'Communication',      value: m.communication },
+    { label: 'Confidence',         value: m.confidence },
     { label: 'Technical Accuracy', value: m.technicalAccuracy },
-    { label: 'Answer Structure', value: m.answerStructure ?? 0 },
-    { label: 'Clarity',          value: m.clarity ?? 0 },
-    { label: 'Body Language',    value: m.bodyLanguage },
+    { label: 'Answer Structure',   value: m.answerStructure ?? 0 },
+    { label: 'Clarity',            value: m.clarity ?? 0 },
+    { label: 'Delivery',           value: m.bodyLanguage },
   ];
 
-  const strengths       = result.strengths       ?? [];
+  const strengths        = result.strengths        ?? [];
   const improvementAreas = result.improvementAreas ?? [];
-  const suggestions     = result.suggestions      ?? [];
+  const suggestions      = result.suggestions       ?? [];
 
   return (
     <div className="max-w-4xl mx-auto py-10 px-4 md:px-6 space-y-6">
@@ -151,7 +227,7 @@ export const ResultsScreen: React.FC<ResultsScreenProps> = ({ result, onDone }) 
         )}
       </div>
 
-      {/* Growth roadmap (improvement plan) */}
+      {/* Growth roadmap */}
       {suggestions.length > 0 && (
         <div className="bg-white dark:bg-slate-800 rounded-[32px] p-8 border border-slate-100 dark:border-slate-700 shadow-sm">
           <h3 className="flex items-center gap-3 font-black text-slate-800 dark:text-white mb-6 text-lg">

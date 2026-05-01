@@ -12,9 +12,10 @@ export default defineConfig(({ mode }) => {
     },
     plugins: [react(), tailwindcss()],
     define: {
-      'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-      'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-      'process.env.GEMINI_MODEL': JSON.stringify(env.GEMINI_MODEL)
+      // Cloud Functions base URL — used by services/aiApi.ts in dev/emulator mode.
+      // In production, aiApi.ts falls back to the hardcoded project URL.
+      'import.meta.env.VITE_FUNCTIONS_BASE_URL': JSON.stringify(env.VITE_FUNCTIONS_BASE_URL || ''),
+      'import.meta.env.VITE_RECAPTCHA_SITE_KEY': JSON.stringify(env.VITE_RECAPTCHA_SITE_KEY || ''),
     },
     resolve: {
       alias: {

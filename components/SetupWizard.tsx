@@ -1,23 +1,24 @@
 import React, { useState } from 'react';
-import { InterviewConfig, InterviewMode, ExperienceLevel, UserPlan } from '../types';
+import { InterviewConfig, InterviewMode, ExperienceLevel, UserPlan, UserPreferences } from '../types';
 
 interface SetupWizardProps {
   onStart: (config: InterviewConfig) => void;
   maxQuestions?: number;
   userPlan?: UserPlan;
+  defaultConfig?: Partial<UserPreferences>;
 }
 
-export const SetupWizard: React.FC<SetupWizardProps> = ({ onStart, maxQuestions = 5, userPlan = 'starter' }) => {
+export const SetupWizard: React.FC<SetupWizardProps> = ({ onStart, maxQuestions = 5, userPlan = 'starter', defaultConfig }) => {
   const [config, setConfig] = useState<InterviewConfig>({
-    jobTitle: 'Software Engineer',
-    level: ExperienceLevel.MID,
-    mode: InterviewMode.BEHAVIORAL,
-    company: 'TechCorp',
-    questionCount: Math.min(3, maxQuestions)
+    jobTitle: defaultConfig?.jobTitle ?? 'Software Engineer',
+    level: defaultConfig?.level ?? ExperienceLevel.MID,
+    mode: defaultConfig?.mode ?? InterviewMode.BEHAVIORAL,
+    company: '',
+    questionCount: Math.min(defaultConfig?.defaultQuestionCount ?? 3, maxQuestions)
   });
 
   return (
-    <div className="max-w-2xl mx-auto py-12 px-6">
+    <div className="max-w-2xl mx-auto py-6 md:py-12 px-4 md:px-6">
       <div className="text-center mb-10">
         <h2 className="text-3xl font-bold text-slate-900 dark:text-white mb-2">Configure Your Interview</h2>
         <p className="text-slate-500">Tailor the AI behavior to your target role and level.</p>
@@ -42,7 +43,7 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onStart, maxQuestions 
           />
         </div>
 
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <label htmlFor="exp-level" className="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
               Experience Level
@@ -82,7 +83,7 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onStart, maxQuestions 
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <label htmlFor="company" className="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
               Company (Optional)

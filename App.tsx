@@ -1,20 +1,55 @@
-import React, { useState, useEffect, lazy, Suspense } from 'react';
+import React, { useState, useEffect, useRef, lazy, Suspense } from 'react';
+
+// Error boundary to catch render errors from lazy-loaded components
+interface EBState { error: string | null }
+class AppErrorBoundary extends React.Component<{ children: React.ReactNode }, EBState> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(err: Error): EBState { return { error: err.message }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex flex-col items-center justify-center h-[80vh] gap-4 px-8 text-center">
+          <div className="w-14 h-14 bg-red-100 dark:bg-red-900/30 rounded-2xl flex items-center justify-center">
+            <svg className="w-7 h-7 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+          </div>
+          <p className="font-bold text-slate-800 dark:text-white text-lg">Something went wrong</p>
+          <p className="text-slate-500 text-sm max-w-md">{this.state.error}</p>
+          <button
+            onClick={() => { this.setState({ error: null }); window.location.hash = ''; }}
+            className="mt-2 px-6 py-2 bg-blue-600 text-white rounded-xl font-semibold text-sm hover:bg-blue-700 transition-colors"
+          >
+            Go Home
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 import { Header } from './components/Header';
 import { Home } from './components/Home';
 import { Login } from './components/Login';
 
 // Lazy-loaded heavy components for code splitting
-const SetupWizard = lazy(() => import('./components/SetupWizard').then((m) => ({ default: m.SetupWizard })));
+import { SetupWizard } from './components/SetupWizard';
 const InterviewSimulation = lazy(() =>
   import('./components/InterviewSimulation').then((m) => ({ default: m.InterviewSimulation }))
 );
 const ResultsScreen = lazy(() => import('./components/ResultsScreen').then((m) => ({ default: m.ResultsScreen })));
-const Dashboard = lazy(() => import('./components/Dashboard').then((m) => ({ default: m.Dashboard })));
+import { Dashboard } from './components/Dashboard';
 const UpgradeModal = lazy(() => import('./components/UpgradeModal').then((m) => ({ default: m.UpgradeModal })));
 const Settings = lazy(() => import('./components/Settings').then((m) => ({ default: m.Settings })));
+import { OnboardingWizard } from './components/OnboardingWizard';
+const AdminDashboard = lazy(() => import('./components/AdminDashboard').then((m) => ({ default: m.AdminDashboard })));
+const EmailVerificationScreen = lazy(() => import('./components/EmailVerificationScreen').then((m) => ({ default: m.EmailVerificationScreen })));
 const TermsOfService = lazy(() => import('./components/TermsOfService'));
 const PrivacyPolicy = lazy(() => import('./components/PrivacyPolicy'));
-import { InterviewConfig, InterviewResult, AppView, UserPlan, PLAN_LIMITS } from './types';
+import { InterviewConfig, InterviewResult, AppView, UserPlan, PLAN_LIMITS, UserPreferences } from './types';
 import { persistenceService } from './services/persistenceService';
 import { planService } from './services/planService';
 import { auth, db } from './services/firebase';
@@ -23,6 +58,9 @@ import { doc, onSnapshot } from 'firebase/firestore';
 import { useTheme } from './hooks/useTheme';
 import { sessionRecovery } from './services/sessionRecovery';
 import { interviewFlowService } from './application/services/interview-flow-service';
+import { firestorePlanRepository } from './infrastructure/plans/firestore-plan-repository';
+
+const ADMIN_UID = 'gTcIsKmAyyWhQfg1eCAb3ZxKFqj2';
 
 // Hash-based routing: maps AppView to URL hashes for SEO & shareability
 const VIEW_TO_HASH: Partial<Record<AppView, string>> = {
@@ -31,7 +69,8 @@ const VIEW_TO_HASH: Partial<Record<AppView, string>> = {
   [AppView.PRIVACY]: 'privacy',
   [AppView.SETUP]: 'setup',
   [AppView.DASHBOARD]: 'dashboard',
-  [AppView.SETTINGS]: 'settings'
+  [AppView.SETTINGS]: 'settings',
+  [AppView.ADMIN]: 'admin',
 };
 
 const HASH_TO_VIEW: Record<string, AppView> = Object.entries(VIEW_TO_HASH).reduce(
@@ -54,11 +93,14 @@ const App: React.FC = () => {
   const [authLoading, setAuthLoading] = useState(true);
   const [activeConfig, setActiveConfig] = useState<InterviewConfig | null>(null);
   const [lastResult, setLastResult] = useState<InterviewResult | null>(null);
+  const [lastSessionDocPath, setLastSessionDocPath] = useState<string | null>(null);
   const [history, setHistory] = useState<InterviewResult[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [recoveryAvailable, setRecoveryAvailable] = useState(false);
   const [userPlan, setUserPlan] = useState<UserPlan>('starter');
   const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const [userPreferences, setUserPreferences] = useState<UserPreferences | null>(null);
+  const prefsLoadedRef = useRef(false);
 
   // Sync URL hash with view state
   const setCurrentView = (view: AppView) => {
@@ -81,56 +123,72 @@ const App: React.FC = () => {
     return () => window.removeEventListener('hashchange', handleHashChange);
   }, []);
 
-  // Dev helper: switch plans from browser console — e.g. setPlan('professional')
-  useEffect(() => {
-    (window as any).setPlan = async (plan: UserPlan) => {
-      setUserPlan(plan);
-      console.log(`Plan switched to: ${plan}`);
-      try {
-        await planService.setUserPlan(plan);
-        console.log('Plan saved to Firestore');
-      } catch (e) {
-        console.warn('Could not save to Firestore (offline?), plan is active locally for this session');
-      }
-    };
-    return () => {
-      delete (window as any).setPlan;
-    };
-  }, []);
 
   useEffect(() => {
     let unsubPlan: (() => void) | null = null;
+    let lastUid: string | null = null;
 
     const unsubscribe = onAuthStateChanged(
       auth,
       (currentUser) => {
+        // Treat unverified email accounts as logged out — prevents brief app flash on signup
+        if (currentUser && !currentUser.emailVerified && currentUser.providerData[0]?.providerId === 'password') {
+          setUser(null);
+          setAuthLoading(false);
+          return;
+        }
         setUser(currentUser);
-        setAuthLoading(false);
         if (currentUser) {
-          persistenceService.getHistory().then(setHistory).catch(console.error);
-          // Initial plan fetch as fallback
-          planService.getUserPlan().then(setUserPlan).catch(console.error);
-          // Real-time listener: auto-updates plan when webhook writes to Firestore
-          const planRef = doc(db, 'users', currentUser.uid, 'profile', 'plan');
-          unsubPlan = onSnapshot(
-            planRef,
-            (snap) => {
-              if (snap.exists()) {
-                const plan = snap.data().plan as UserPlan;
-                if (plan === 'professional' || plan === 'premium' || plan === 'starter') {
-                  setUserPlan(plan);
+          // Only run setup logic when the user changes (new sign-in), not on token refreshes
+          if (currentUser.uid !== lastUid) {
+            lastUid = currentUser.uid;
+            setHistory([]); // Clear immediately so stale data never shows while loading
+            persistenceService.getHistory(currentUser.uid).then(setHistory).catch(console.error);
+            // Initial plan fetch as fallback
+            planService.getUserPlan().then(setUserPlan).catch(console.error);
+            // Load preferences; if none exist → show onboarding
+            // Keep authLoading true until prefs check completes to prevent dashboard flash
+            if (!prefsLoadedRef.current) {
+              firestorePlanRepository.getPreferences(currentUser.uid).then((prefs) => {
+                prefsLoadedRef.current = true;
+                if (prefs) {
+                  setUserPreferences(prefs);
+                } else {
+                  setCurrentView(AppView.ONBOARDING);
                 }
-              }
-            },
-            (err) => console.warn('Plan listener error:', err)
-          );
+              }).catch(console.error).finally(() => {
+                setAuthLoading(false);
+              });
+            } else {
+              setAuthLoading(false);
+            }
+            // Real-time listener: auto-updates plan when webhook writes to Firestore
+            const planRef = doc(db, 'users', currentUser.uid, 'profile', 'plan');
+            unsubPlan = onSnapshot(
+              planRef,
+              (snap) => {
+                if (snap.exists()) {
+                  const plan = snap.data().plan as UserPlan;
+                  if (plan === 'professional' || plan === 'premium' || plan === 'starter') {
+                    setUserPlan(plan);
+                  }
+                }
+              },
+              (err) => console.warn('Plan listener error:', err)
+            );
+          }
         } else {
-          // User signed out — clean up plan listener
+          // User signed out — clean up plan listener and clear all user data
+          setAuthLoading(false);
+          lastUid = null;
           if (unsubPlan) {
             unsubPlan();
             unsubPlan = null;
           }
           setUserPlan('starter');
+          setHistory([]);
+          setUserPreferences(null);
+          prefsLoadedRef.current = false;
         }
       },
       (err) => {
@@ -173,15 +231,29 @@ const App: React.FC = () => {
     }
   }, [error]);
 
-  const handleFinishInterview = (result: InterviewResult) => {
+  const handleFinishInterview = (result: InterviewResult & { status?: string }) => {
     setLastResult(result);
-    setHistory((prev) => [result, ...prev]); // Update history immediately for instant Dashboard display
+    setHistory((prev) => [result, ...prev]);
+    // If the interview was saved to Firestore with status "processing", build the doc path
+    // so ResultsScreen can listen for the evaluation to complete.
+    // InterviewSimulation already saves to Firestore directly — no need to save again here
+    setLastSessionDocPath(null);
     setCurrentView(AppView.RESULTS);
-    persistenceService.saveInterview(result).catch((e) => console.error('Failed to save session:', e));
   };
 
-  const handleStartInterviewFlow = (cfg: InterviewConfig) => {
-    const decision = interviewFlowService.canStartInterview(userPlan, history);
+  const handleStartInterviewFlow = async (cfg: InterviewConfig) => {
+    // Always fetch fresh history from Firestore before checking limits
+    // so a hard-refresh doesn't reset the in-memory count to zero
+    let freshHistory = history;
+    if (user) {
+      try {
+        freshHistory = await persistenceService.getHistory(user.uid);
+        setHistory(freshHistory);
+      } catch {
+        // fall back to in-memory history if fetch fails
+      }
+    }
+    const decision = interviewFlowService.canStartInterview(userPlan, freshHistory);
     if (!decision.allowed) {
       setShowUpgradeModal(true);
       return;
@@ -189,6 +261,20 @@ const App: React.FC = () => {
 
     setActiveConfig(cfg);
     setCurrentView(AppView.SIMULATION);
+  };
+
+  const handleOnboardingComplete = (prefs: UserPreferences) => {
+    if (!user) return;
+    prefsLoadedRef.current = true;
+    setUserPreferences(prefs);
+    setCurrentView(AppView.DASHBOARD);
+    firestorePlanRepository.savePreferences(user.uid, prefs).catch(console.error);
+  };
+
+  const handleSavePreferences = async (prefs: UserPreferences) => {
+    if (!user) return;
+    await firestorePlanRepository.savePreferences(user.uid, prefs);
+    setUserPreferences(prefs);
   };
 
   const handleLoginClick = () => {
@@ -232,12 +318,46 @@ const App: React.FC = () => {
         return <TermsOfService onGoHome={() => setCurrentView(AppView.HOME)} />;
       case AppView.PRIVACY:
         return <PrivacyPolicy onGoHome={() => setCurrentView(AppView.HOME)} />;
+      case AppView.EMAIL_VERIFICATION:
+        return user ? (
+          <EmailVerificationScreen
+            user={user}
+            onVerified={() => {
+              // Re-run post-login setup now that email is verified
+              firestorePlanRepository.getPreferences(user.uid).then((prefs) => {
+                if (prefs) {
+                  setUserPreferences(prefs);
+                  setCurrentView(AppView.DASHBOARD);
+                } else {
+                  setCurrentView(AppView.ONBOARDING);
+                }
+              }).catch(() => setCurrentView(AppView.ONBOARDING));
+            }}
+          />
+        ) : (
+          <Login />
+        );
+      case AppView.ONBOARDING:
+        return user ? (
+          <OnboardingWizard onComplete={handleOnboardingComplete} />
+        ) : (
+          <Login />
+        );
+      case AppView.ADMIN:
+        if (authLoading) return null;
+        return user?.uid === ADMIN_UID ? (
+          <AdminDashboard />
+        ) : (
+          <Home onStart={() => setCurrentView(AppView.SETUP)} onGoDashboard={() => setCurrentView(AppView.DASHBOARD)} />
+        );
       case AppView.SETUP:
+        if (!user) return <Login />;
         return (
           <SetupWizard
             onStart={handleStartInterviewFlow}
             maxQuestions={PLAN_LIMITS[userPlan].maxQuestionsPerSession}
             userPlan={userPlan}
+            defaultConfig={userPreferences ?? undefined}
           />
         );
       case AppView.SIMULATION:
@@ -253,11 +373,16 @@ const App: React.FC = () => {
             onStart={handleStartInterviewFlow}
             maxQuestions={PLAN_LIMITS[userPlan].maxQuestionsPerSession}
             userPlan={userPlan}
+            defaultConfig={userPreferences ?? undefined}
           />
         );
       case AppView.RESULTS:
         return lastResult ? (
-          <ResultsScreen result={lastResult} onDone={() => setCurrentView(AppView.DASHBOARD)} />
+          <ResultsScreen
+            result={lastResult}
+            onDone={() => setCurrentView(AppView.DASHBOARD)}
+            sessionDocPath={lastSessionDocPath ?? undefined}
+          />
         ) : (
           <Dashboard history={history} onStartNew={() => setCurrentView(AppView.SETUP)} />
         );
@@ -273,6 +398,8 @@ const App: React.FC = () => {
             onSignOut={() => signOut(auth)}
             history={history}
             onClearHistory={handleClearHistory}
+            userPreferences={userPreferences}
+            onSavePreferences={handleSavePreferences}
           />
         ) : (
           <Login />
@@ -290,6 +417,7 @@ const App: React.FC = () => {
         onGoHome={() => setCurrentView(AppView.HOME)}
         onGoDashboard={() => setCurrentView(AppView.DASHBOARD)}
         onGoSettings={() => setCurrentView(AppView.SETTINGS)}
+        onGoAdmin={user?.uid === ADMIN_UID ? () => setCurrentView(AppView.ADMIN) : undefined}
         onLogin={handleLoginClick}
         theme={theme}
         onToggleTheme={toggleTheme}
@@ -297,16 +425,18 @@ const App: React.FC = () => {
       />
 
       <main className="relative z-10 min-h-[calc(100vh-80px)]">
-        <Suspense
-          fallback={
-            <div className="flex flex-col items-center justify-center h-[80vh] gap-4">
-              <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" />
-              <p className="font-bold text-slate-400 uppercase tracking-widest text-xs">Loading...</p>
-            </div>
-          }
-        >
-          {renderContent()}
-        </Suspense>
+        <AppErrorBoundary>
+          <Suspense
+            fallback={
+              <div className="flex flex-col items-center justify-center h-[80vh] gap-4">
+                <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" />
+                <p className="font-bold text-slate-400 uppercase tracking-widest text-xs">Loading...</p>
+              </div>
+            }
+          >
+            {renderContent()}
+          </Suspense>
+        </AppErrorBoundary>
       </main>
 
       {recoveryAvailable && currentView === AppView.HOME && (
