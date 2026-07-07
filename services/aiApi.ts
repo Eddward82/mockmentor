@@ -228,6 +228,12 @@ export async function generateQuestions(
     body: JSON.stringify({ config, count }),
   });
 
+  if (res.status === 403) {
+    // Server-side plan quota reached — surface it instead of silently
+    // falling back to canned questions.
+    throw new Error('Monthly plan limit reached. Please upgrade to continue practicing.');
+  }
+
   if (!res.ok) {
     console.error('generateQuestions failed:', await res.text());
     return [

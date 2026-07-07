@@ -1,33 +1,21 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { InterviewMode, ExperienceLevel } from '../../types';
 
-// Mock the Google GenAI SDK
-vi.mock('@google/genai', () => ({
-  GoogleGenAI: vi.fn().mockImplementation(() => ({
-    models: {
-      generateContent: vi.fn().mockResolvedValue({
-        text: JSON.stringify({
-          question: 'Tell me about a challenging project.',
-          tips: ['Be specific', 'Quantify results', 'Show impact'],
-          timeLimit: 90
-        })
-      })
-    }
-  })),
-  Type: {
-    OBJECT: 'object',
-    STRING: 'string',
-    ARRAY: 'array',
-    NUMBER: 'number'
-  }
+// geminiService delegates to the backend API layer — mock it.
+vi.mock('../../services/aiApi', () => ({
+  generateQuestions: vi.fn(),
+  analyzeInterview: vi.fn(),
 }));
+
+import { generateQuestions as apiGenerateQuestions, analyzeInterview as apiAnalyzeInterview } from '../../services/aiApi';
+import { generateQuestion, generateQuestions, generateInterviewSummary } from '../../services/geminiService';
 
 describe('geminiService', () => {
   const mockConfig = {
     jobTitle: 'Software Engineer',
     level: ExperienceLevel.MID,
     mode: InterviewMode.BEHAVIORAL,
-    company: 'TestCorp'
+    company: 'TestCorp',
   };
 
   beforeEach(() => {
@@ -35,56 +23,67 @@ describe('geminiService', () => {
   });
 
   describe('generateQuestion', () => {
-    it('should return a valid InterviewQuestion', async () => {
-      const { generateQuestion } = await import('../../services/geminiService');
+    it('returns the first question from the API', async () => {
+      vi.mocked(apiGenerateQuestions).mockResolvedValue([
+        { question: 'Tell me about a challenging project.', tips: ['Be specific', 'Quantify results', 'Show impact'], timeLimit: 90 },
+      ]);
+
+      const result = await generateQuestion(mockConfig);
+
+      expect(apiGenerateQuestions).toHaveBeenCalledWith(mockConfig, 1);
+      expect(result.question).toBe('Tell me about a challenging project.');
+      expect(Array.isArray(result.tips)).toBe(true);
+      expect(typeof result.timeLimit).toBe('number');
+    });
+
+    it('falls back to a default question when the API returns none', async () => {
+      vi.mocked(apiGenerateQuestions).mockResolvedValue([]);
+
       const result = await generateQuestion(mockConfig);
 
       expect(result).toHaveProperty('question');
-      expect(result).toHaveProperty('tips');
-      expect(result).toHaveProperty('timeLimit');
-      expect(Array.isArray(result.tips)).toBe(true);
+      expect(result.tips).toHaveLength(3);
       expect(typeof result.timeLimit).toBe('number');
     });
   });
 
-  describe('generateInterviewSummary', () => {
-    it('should return metrics and suggestions', async () => {
-      const { GoogleGenAI } = await import('@google/genai');
-      vi.mocked(GoogleGenAI).mockImplementation(
-        () =>
-          ({
-            models: {
-              generateContent: vi.fn().mockResolvedValue({
-                text: JSON.stringify({
-                  metrics: {
-                    communication: 80,
-                    confidence: 75,
-                    technicalAccuracy: 85,
-                    bodyLanguage: 70,
-                    overall: 78
-                  },
-                  suggestions: ['Practice more', 'Be concise']
-                })
-              })
-            }
-          }) as ReturnType<typeof GoogleGenAI>
-      );
+  describe('generateQuestions', () => {
+    it('delegates to the API with the requested count', async () => {
+      const questions = [
+        { question: 'Q1', tips: ['a', 'b', 'c'], timeLimit: 60 },
+        { question: 'Q2', tips: ['a', 'b', 'c'], timeLimit: 90 },
+      ];
+      vi.mocked(apiGenerateQuestions).mockResolvedValue(questions);
 
-      const { generateInterviewSummary } = await import('../../services/geminiService');
-      const result = await generateInterviewSummary(mockConfig, 'Test transcript');
+      const result = await generateQuestions(mockConfig, 2);
 
-      expect(result).toHaveProperty('metrics');
-      expect(result).toHaveProperty('suggestions');
+      expect(apiGenerateQuestions).toHaveBeenCalledWith(mockConfig, 2);
+      expect(result).toEqual(questions);
     });
   });
 
-  describe('ANALYTICS_FUNCTION_DECLARATION', () => {
-    it('should export a valid function declaration', async () => {
-      const { ANALYTICS_FUNCTION_DECLARATION } = await import('../../services/geminiService');
+  describe('generateInterviewSummary', () => {
+    it('returns metrics and suggestions from the API', async () => {
+      vi.mocked(apiAnalyzeInterview).mockResolvedValue({
+        metrics: {
+          communication: 80,
+          confidence: 75,
+          technicalAccuracy: 85,
+          bodyLanguage: 70,
+          answerStructure: 72,
+          clarity: 77,
+          overall: 78,
+        },
+        strengths: ['Clear examples'],
+        improvementAreas: ['Pacing'],
+        suggestions: ['Practice more', 'Be concise'],
+      });
 
-      expect(ANALYTICS_FUNCTION_DECLARATION).toHaveProperty('name');
-      expect(ANALYTICS_FUNCTION_DECLARATION.name).toBe('updateAnalytics');
-      expect(ANALYTICS_FUNCTION_DECLARATION).toHaveProperty('parameters');
+      const result = await generateInterviewSummary(mockConfig, 'Test transcript');
+
+      expect(apiAnalyzeInterview).toHaveBeenCalledWith(mockConfig, 'Test transcript');
+      expect(result).toHaveProperty('metrics');
+      expect(result).toHaveProperty('suggestions');
     });
   });
 });

@@ -5,22 +5,15 @@ import { getFirestore } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
 import { initializeAppCheck, ReCaptchaV3Provider } from 'firebase/app-check';
 
-const getEnv = (key: string, fallback: string): string => {
-  try {
-    const env = (window as any).process?.env || (typeof process !== 'undefined' ? process.env : {});
-    return env[key] || fallback;
-  } catch (e) {
-    return fallback;
-  }
-};
-
+// Firebase web config is public by design — access control lives in
+// Firestore rules, App Check, and the Cloud Functions auth checks.
 const firebaseConfig = {
-  apiKey: getEnv('FIREBASE_API_KEY', 'AIzaSyAgok7C_4SGlOv3CibSJ9btpLRC5f1XqLY'),
-  authDomain: getEnv('FIREBASE_AUTH_DOMAIN', 'sql-calculation-393000.firebaseapp.com'),
-  projectId: getEnv('FIREBASE_PROJECT_ID', 'sql-calculation-393000'),
-  storageBucket: getEnv('FIREBASE_STORAGE_BUCKET', 'sql-calculation-393000.firebasestorage.app'),
-  messagingSenderId: getEnv('FIREBASE_MESSAGING_SENDER_ID', '755973674567'),
-  appId: getEnv('FIREBASE_APP_ID', '1:755973674567:web:f3fc6016e1bfbda3144362')
+  apiKey: 'AIzaSyAgok7C_4SGlOv3CibSJ9btpLRC5f1XqLY',
+  authDomain: 'sql-calculation-393000.firebaseapp.com',
+  projectId: 'sql-calculation-393000',
+  storageBucket: 'sql-calculation-393000.firebasestorage.app',
+  messagingSenderId: '755973674567',
+  appId: '1:755973674567:web:f3fc6016e1bfbda3144362'
 };
 
 // Ensure app is initialized exactly once with a consistent version of the SDK

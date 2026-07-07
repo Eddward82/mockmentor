@@ -1,9 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { type User, deleteUser, reauthenticateWithCredential, EmailAuthProvider, GoogleAuthProvider, reauthenticateWithPopup } from 'firebase/auth';
 import { UserPlan, PLAN_LIMITS, InterviewResult, UserPreferences, ExperienceLevel, InterviewMode } from '../types';
-import { persistenceService } from '../services/persistenceService';
+import { compositionRoot } from '../infrastructure/composition/root';
 import { db } from '../services/firebase';
 import { collection, getDocs, deleteDoc } from 'firebase/firestore';
+
+const persistenceService = compositionRoot.interviewHistoryRepository;
 
 interface SettingsProps {
   user: User;

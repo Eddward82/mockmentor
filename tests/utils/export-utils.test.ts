@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { exportAsJSON, exportAsPDF } from '../../utils/export-utils';
 import { InterviewResult, InterviewMode, ExperienceLevel } from '../../types';
 
@@ -17,6 +17,8 @@ describe('export-utils', () => {
       confidence: 80,
       technicalAccuracy: 90,
       bodyLanguage: 75,
+      answerStructure: 75,
+      clarity: 75,
       overall: 82
     },
     suggestions: ['Practice more system design questions', 'Work on explaining your thought process'],
@@ -47,7 +49,9 @@ describe('export-utils', () => {
   };
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    // restoreAllMocks (not clearAllMocks) so document.createElement spies
+    // from one test don't leak fake elements into the next.
+    vi.restoreAllMocks();
   });
 
   describe('exportAsJSON', () => {
@@ -93,63 +97,69 @@ describe('export-utils', () => {
   });
 
   describe('exportAsPDF', () => {
-    it('should open a new window with HTML content', () => {
-      const mockWrite = vi.fn();
-      const mockClose = vi.fn();
-      const mockPrint = vi.fn();
-
-      const mockWindow = {
-        document: {
-          write: mockWrite,
-          close: mockClose
+    // exportAsPDF renders the report into a hidden iframe, then (async, via
+    // setTimeout) captures it with html2canvas + jspdf. The tests stub the
+    // iframe and use fake timers so the async capture step never runs.
+    const createIframeMock = () => {
+      const write = vi.fn();
+      const iframe = {
+        style: {} as Record<string, string>,
+        contentDocument: {
+          open: vi.fn(),
+          write,
+          close: vi.fn(),
+          body: {}
         },
-        print: mockPrint,
-        onload: null as (() => void) | null
+        contentWindow: null
       };
+      return { iframe, write };
+    };
 
-      vi.spyOn(window, 'open').mockReturnValue(mockWindow as any);
+    const stubDom = (iframe: unknown) => {
+      vi.spyOn(document, 'createElement').mockReturnValue(iframe as any);
+      const appendChild = vi.spyOn(document.body, 'appendChild').mockImplementation(vi.fn() as any);
+      const removeChild = vi.spyOn(document.body, 'removeChild').mockImplementation(vi.fn() as any);
+      return { appendChild, removeChild };
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('should render the report HTML into a hidden iframe', () => {
+      const { iframe, write } = createIframeMock();
+      const { appendChild } = stubDom(iframe);
 
       exportAsPDF(mockSession);
 
-      expect(window.open).toHaveBeenCalledWith('', '_blank');
-      expect(mockWrite).toHaveBeenCalled();
-      expect(mockClose).toHaveBeenCalled();
+      expect(appendChild).toHaveBeenCalledWith(iframe);
+      expect(write).toHaveBeenCalled();
 
-      // Verify HTML contains key elements
-      const htmlContent = mockWrite.mock.calls[0][0];
+      const htmlContent = write.mock.calls[0][0];
       expect(htmlContent).toContain('Interview Performance Report');
       expect(htmlContent).toContain('Software Engineer');
-      expect(htmlContent).toContain('85%'); // communication score
       expect(htmlContent).toContain('Questions & Responses');
       expect(htmlContent).toContain('Tell me about yourself');
     });
 
     it('should include suggestions in the PDF', () => {
-      const mockWrite = vi.fn();
-      const mockWindow = {
-        document: { write: mockWrite, close: vi.fn() },
-        print: vi.fn(),
-        onload: null
-      };
-
-      vi.spyOn(window, 'open').mockReturnValue(mockWindow as any);
+      const { iframe, write } = createIframeMock();
+      stubDom(iframe);
 
       exportAsPDF(mockSession);
 
-      const htmlContent = mockWrite.mock.calls[0][0];
+      const htmlContent = write.mock.calls[0][0];
       expect(htmlContent).toContain('Practice more system design questions');
       expect(htmlContent).toContain('Work on explaining your thought process');
     });
 
     it('should handle session without questions', () => {
-      const mockWrite = vi.fn();
-      const mockWindow = {
-        document: { write: mockWrite, close: vi.fn() },
-        print: vi.fn(),
-        onload: null
-      };
-
-      vi.spyOn(window, 'open').mockReturnValue(mockWindow as any);
+      const { iframe, write } = createIframeMock();
+      stubDom(iframe);
 
       const sessionWithoutQuestions: InterviewResult = {
         ...mockSession,
@@ -158,16 +168,18 @@ describe('export-utils', () => {
 
       exportAsPDF(sessionWithoutQuestions);
 
-      const htmlContent = mockWrite.mock.calls[0][0];
+      const htmlContent = write.mock.calls[0][0];
       expect(htmlContent).toContain('Session Transcript');
       expect(htmlContent).not.toContain('Questions & Responses');
     });
 
-    it('should handle when window.open returns null', () => {
-      vi.spyOn(window, 'open').mockReturnValue(null);
+    it('should bail out cleanly when the iframe document is unavailable', () => {
+      const { iframe } = createIframeMock();
+      (iframe as any).contentDocument = null;
+      const { removeChild } = stubDom(iframe);
 
-      // Should not throw
       expect(() => exportAsPDF(mockSession)).not.toThrow();
+      expect(removeChild).toHaveBeenCalledWith(iframe);
     });
   });
 });

@@ -30,6 +30,8 @@ describe('persistenceService', () => {
       confidence: 75,
       technicalAccuracy: 85,
       bodyLanguage: 70,
+      answerStructure: 70,
+      clarity: 70,
       overall: 78
     },
     suggestions: ['Practice more'],
@@ -44,34 +46,35 @@ describe('persistenceService', () => {
 
   describe('localStorage fallback', () => {
     it('should handle saveInterview call without throwing', async () => {
-      const { persistenceService } = await import('../../services/persistenceService');
+      const { compositionRoot } = await import('../../infrastructure/composition/root');
+      const persistenceService = compositionRoot.interviewHistoryRepository;
 
       // Save might go to Firestore or localStorage depending on mock
       // Just verify it doesn't throw
       await expect(persistenceService.saveInterview(mockResult)).resolves.not.toThrow();
     });
 
-    it('should clear localStorage history', async () => {
-      localStorage.setItem('ai_interview_history', JSON.stringify([mockResult]));
-
-      const { persistenceService } = await import('../../services/persistenceService');
-      await persistenceService.clearHistory();
-
-      expect(localStorage.getItem('ai_interview_history')).toBeNull();
+    it('should handle clearHistory without throwing when signed out', async () => {
+      // History is Firestore-backed; with no signed-in user this is a no-op.
+      const { compositionRoot } = await import('../../infrastructure/composition/root');
+      const persistenceService = compositionRoot.interviewHistoryRepository;
+      await expect(persistenceService.clearHistory()).resolves.not.toThrow();
     });
   });
 
   describe('getHistory', () => {
     it('should return array', async () => {
-      const { persistenceService } = await import('../../services/persistenceService');
-      const result = await persistenceService.getHistory();
+      const { compositionRoot } = await import('../../infrastructure/composition/root');
+      const persistenceService = compositionRoot.interviewHistoryRepository;
+      const result = await persistenceService.getHistory('test-uid');
       expect(Array.isArray(result)).toBe(true);
     });
   });
 
   describe('getMonthlyInterviewCount', () => {
     it('should return a number', async () => {
-      const { persistenceService } = await import('../../services/persistenceService');
+      const { compositionRoot } = await import('../../infrastructure/composition/root');
+      const persistenceService = compositionRoot.interviewHistoryRepository;
       const count = await persistenceService.getMonthlyInterviewCount();
       expect(typeof count).toBe('number');
       expect(count).toBeGreaterThanOrEqual(0);

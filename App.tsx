@@ -50,8 +50,7 @@ const EmailVerificationScreen = lazy(() => import('./components/EmailVerificatio
 const TermsOfService = lazy(() => import('./components/TermsOfService'));
 const PrivacyPolicy = lazy(() => import('./components/PrivacyPolicy'));
 import { InterviewConfig, InterviewResult, AppView, UserPlan, PLAN_LIMITS, UserPreferences } from './types';
-import { persistenceService } from './services/persistenceService';
-import { planService } from './services/planService';
+import { compositionRoot } from './infrastructure/composition/root';
 import { auth, db } from './services/firebase';
 import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import { doc, onSnapshot } from 'firebase/firestore';
@@ -61,6 +60,9 @@ import { interviewFlowService } from './application/services/interview-flow-serv
 import { firestorePlanRepository } from './infrastructure/plans/firestore-plan-repository';
 
 const ADMIN_UID = 'gTcIsKmAyyWhQfg1eCAb3ZxKFqj2';
+
+const persistenceService = compositionRoot.interviewHistoryRepository;
+const planService = compositionRoot.planService;
 
 // Hash-based routing: maps AppView to URL hashes for SEO & shareability
 const VIEW_TO_HASH: Partial<Record<AppView, string>> = {

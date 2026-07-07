@@ -2,15 +2,57 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Admin UID — full read access across all user data
+    // Admin — custom claim (set via admin SDK) with legacy UID fallback
     function isAdmin() {
-      return request.auth != null && request.auth.uid == 'gTcIsKmAyyWhQfg1eCAb3ZxKFqj2';
+      return request.auth != null
+        && (request.auth.token.admin == true
+            || request.auth.uid == 'gTcIsKmAyyWhQfg1eCAb3ZxKFqj2');
     }
 
-    match /users/{userId}/{document=**} {
-      // Users can read/write their own data; admin can read all
-      allow read: if request.auth != null && (request.auth.uid == userId || isAdmin());
-      allow write: if request.auth != null && request.auth.uid == userId;
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // Bound any transcript-bearing field so clients can't trigger unbounded
+    // server-side Gemini evaluations or store oversized documents.
+    function transcriptFieldsBounded(data) {
+      return (!('transcript' in data)
+              || (data.transcript is string && data.transcript.size() < 100000))
+          && (!('transcription' in data)
+              || (data.transcription is string && data.transcription.size() < 100000));
+    }
+
+    // NOTE: rules are additive — any matching `allow` grants access — so user
+    // data paths are enumerated explicitly instead of using a {document=**}
+    // catch-all that would override the plan-doc restriction below.
+
+    // Profile docs (preferences, etc.). The billing plan doc is written ONLY
+    // by Cloud Functions (Polar webhook via admin SDK); client writes here
+    // would allow free self-upgrades to paid plans. Owner may still delete it
+    // as part of account deletion.
+    match /users/{userId}/profile/{docId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create, update: if isOwner(userId) && docId != 'plan';
+      allow delete: if isOwner(userId);
+    }
+
+    // Interview results
+    match /users/{userId}/interviews/{sessionId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create, update: if isOwner(userId)
+        && transcriptFieldsBounded(request.resource.data);
+      allow delete: if isOwner(userId);
+    }
+
+    // Live-session transcript entries
+    match /users/{userId}/sessions/{sessionId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow write: if isOwner(userId);
+
+      match /transcript/{entryId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow write: if isOwner(userId);
+      }
     }
 
     // Admin analytics — read-only for admin; written only by Cloud Functions (service account)

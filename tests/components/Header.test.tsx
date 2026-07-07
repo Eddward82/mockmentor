@@ -18,7 +18,8 @@ describe('Header', () => {
     onGoDashboard: vi.fn(),
     onLogin: vi.fn(),
     theme: 'light' as const,
-    onToggleTheme: vi.fn()
+    onToggleTheme: vi.fn(),
+    onGoSettings: vi.fn()
   };
 
   it('should render the MockMentor brand', () => {

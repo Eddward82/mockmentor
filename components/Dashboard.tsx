@@ -13,8 +13,10 @@ import {
   Tooltip,
   CartesianGrid
 } from 'recharts';
-import { persistenceService } from '../services/persistenceService';
+import { compositionRoot } from '../infrastructure/composition/root';
 import { exportAsJSON, exportAsPDF } from '../utils/export-utils';
+
+const persistenceService = compositionRoot.interviewHistoryRepository;
 
 interface DashboardProps {
   history: InterviewResult[];

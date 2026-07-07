@@ -40,6 +40,8 @@ const mockHistory: InterviewResult[] = [
       confidence: 80,
       technicalAccuracy: 90,
       bodyLanguage: 75,
+      answerStructure: 75,
+      clarity: 75,
       overall: 82
     },
     suggestions: ['Practice system design', 'Work on communication'],

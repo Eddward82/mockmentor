@@ -16,6 +16,36 @@ vi.mock('../services/firebase', () => ({
   }
 }));
 
+// Mock the firestore SDK itself — importing the real package in jsdom pulls
+// in the Node/gRPC build, which crashes at import time.
+vi.mock('firebase/firestore', () => ({
+  getFirestore: vi.fn(() => ({})),
+  collection: vi.fn(),
+  doc: vi.fn(),
+  getDoc: vi.fn().mockResolvedValue({ exists: () => false, data: () => undefined }),
+  getDocs: vi.fn().mockResolvedValue({ docs: [] }),
+  addDoc: vi.fn().mockResolvedValue({ id: 'test-doc-id' }),
+  setDoc: vi.fn().mockResolvedValue(undefined),
+  deleteDoc: vi.fn().mockResolvedValue(undefined),
+  onSnapshot: vi.fn(() => vi.fn()),
+  query: vi.fn(),
+  orderBy: vi.fn(),
+  where: vi.fn(),
+  limit: vi.fn(),
+  Timestamp: {
+    now: () => ({ toDate: () => new Date(), toMillis: () => Date.now() }),
+    fromDate: (d: Date) => ({ toDate: () => d, toMillis: () => d.getTime() })
+  }
+}));
+
+// Mock ResizeObserver (used by recharts ResponsiveContainer, missing in jsdom)
+class MockResizeObserver {
+  observe = vi.fn();
+  unobserve = vi.fn();
+  disconnect = vi.fn();
+}
+vi.stubGlobal('ResizeObserver', MockResizeObserver);
+
 // Mock MediaDevices API
 Object.defineProperty(navigator, 'mediaDevices', {
   value: {

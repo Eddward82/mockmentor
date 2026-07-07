@@ -14,10 +14,6 @@ export class PlanService {
     return this.planPort.getUserPlan();
   }
 
-  setUserPlan(plan: UserPlan): Promise<void> {
-    return this.planPort.setUserPlan(plan);
-  }
-
   async getSessionCount(_plan?: UserPlan): Promise<number> {
     const uid = auth.currentUser?.uid;
     if (!uid) return 0;
@@ -54,6 +50,7 @@ export class PlanService {
     if (!uid) return { allowed: false, reason: 'session_limit_reached' };
     const history = await this.interviewHistoryPort.getHistory(uid);
     const result = interviewFlowService.canStartInterview(plan, history);
-    return result.allowed ? { allowed: true } : { allowed: false, reason: result.reason };
+    if (result.allowed === false) return { allowed: false, reason: result.reason };
+    return { allowed: true };
   }
 }

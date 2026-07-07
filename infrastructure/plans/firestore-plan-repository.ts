@@ -23,13 +23,8 @@ class FirestorePlanRepository implements PlanPort {
     return 'starter';
   }
 
-  async setUserPlan(plan: UserPlan): Promise<void> {
-    const user = auth.currentUser;
-    if (!user) return;
-
-    const profileRef = doc(db, 'users', user.uid, 'profile', 'plan');
-    await setDoc(profileRef, { plan }, { merge: true });
-  }
+  // Plan writes happen ONLY server-side (Polar webhook via admin SDK).
+  // Firestore rules deny client writes to the plan doc.
 
   async getPreferences(uid: string): Promise<UserPreferences | null> {
     try {

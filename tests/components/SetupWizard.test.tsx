@@ -21,7 +21,7 @@ describe('SetupWizard', () => {
   it('should have default values', () => {
     render(<SetupWizard onStart={vi.fn()} />);
     expect(screen.getByLabelText('Target Job Title')).toHaveValue('Software Engineer');
-    expect(screen.getByLabelText('Company (Optional)')).toHaveValue('TechCorp');
+    expect(screen.getByLabelText('Company (Optional)')).toHaveValue('');
   });
 
   it('should call onStart with config when Start Interview Session is clicked', async () => {
@@ -32,7 +32,7 @@ describe('SetupWizard', () => {
     expect(onStart).toHaveBeenCalledWith(
       expect.objectContaining({
         jobTitle: 'Software Engineer',
-        company: 'TechCorp',
+        company: '',
         questionCount: 3
       })
     );

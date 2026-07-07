@@ -17,6 +17,8 @@ const mockResult: InterviewResult = {
     confidence: 92,
     technicalAccuracy: 85,
     bodyLanguage: 78,
+    answerStructure: 78,
+    clarity: 78,
     overall: 86
   },
   suggestions: ['Improve eye contact during technical explanations', 'Add more quantitative results'],
@@ -43,10 +45,13 @@ describe('ResultsScreen', () => {
 
   it('should render metric categories', async () => {
     render(<ResultsScreen result={mockResult} onDone={vi.fn()} />);
-    expect(screen.getByText('Comm.')).toBeInTheDocument();
+    // Radar-chart SVG labels don't render in jsdom (zero-size container),
+    // so assert on the HTML score-bar labels instead.
+    expect(screen.getByText('Communication')).toBeInTheDocument();
     expect(screen.getByText('Confidence')).toBeInTheDocument();
-    expect(screen.getByText('Technical')).toBeInTheDocument();
-    expect(screen.getByText('Visuals')).toBeInTheDocument();
+    expect(screen.getByText('Technical Accuracy')).toBeInTheDocument();
+    expect(screen.getByText('Clarity')).toBeInTheDocument();
+    expect(screen.getByText('Delivery')).toBeInTheDocument();
   });
 
   it('should render suggestions', () => {

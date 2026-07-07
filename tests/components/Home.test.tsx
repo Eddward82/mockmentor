@@ -31,10 +31,10 @@ describe('Home', () => {
     expect(onStart).toHaveBeenCalledOnce();
   });
 
-  it('should call onStart when Explore Dashboard is clicked', async () => {
-    const onStart = vi.fn();
-    render(<Home onStart={onStart} />);
+  it('should call onGoDashboard when Explore Dashboard is clicked', async () => {
+    const onGoDashboard = vi.fn();
+    render(<Home onStart={vi.fn()} onGoDashboard={onGoDashboard} />);
     await userEvent.click(screen.getByText('Explore Dashboard'));
-    expect(onStart).toHaveBeenCalledTimes(1);
+    expect(onGoDashboard).toHaveBeenCalledTimes(1);
   });
 });
